@@ -19,6 +19,7 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn packed(self) -> u32 {
         u32::from(self.r) | (u32::from(self.g) << 8) | (u32::from(self.b) << 16)
     }

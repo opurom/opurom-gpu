@@ -4,9 +4,10 @@
 //! code is compiled only on macOS; other targets return `MetalUnavailable`.
 //!
 //! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
-//! display list to a Metal compute kernel. Text glyph compositing stays CPU-side
-//! in R6: the kernel executes solid rects, rounded rects and two-stop gradients
-//! only.
+//! display list to Metal compute kernels. R9 adds five effect command types:
+//! blur, shadow, glow, glass and liquid execute as real multi-pass MSL kernels
+//! with frame snapshots and readback. Text glyph compositing stays CPU-side:
+//! glyphs reach the GPU only as pre-decomposed solid rectangles.
 
 use std::fmt;
 use std::time::Duration;
@@ -18,8 +19,9 @@ mod reference;
 mod metal;
 
 pub use display::{
-    parse_display_list, render_cpu_commands, Command, DisplayList, COMMAND_WORDS, COORD_BIAS,
-    MAX_COMMANDS as MAX_DISPLAY_COMMANDS,
+    parse_display_list, render_cpu_commands, Command, DisplayList, Pass, COMMAND_WORDS, COORD_BIAS,
+    KERNEL_BATCH, KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_MASK, KERNEL_SNAPSHOT,
+    MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS,
 };
 pub use reference::{render_cpu, Rgb};
 
@@ -239,16 +241,16 @@ pub fn display_byte_count(width: u32, height: u32) -> Result<usize, GpuError> {
 /// Execute one parsed display list on the Metal compute device.
 pub fn raster_display(list: &DisplayList) -> Result<GpuFrame, GpuError> {
     let byte_count = display_byte_count(list.width, list.height)?;
-    let packed = list.pack()?;
+    let (packed, passes) = list.build_passes()?;
 
     #[cfg(target_os = "macos")]
     {
-        metal::raster(list, &packed, byte_count)
+        metal::raster(&packed, &passes, byte_count)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (packed, byte_count);
+        let _ = (packed, passes, byte_count);
         Err(GpuError::metal_unavailable())
     }
 }

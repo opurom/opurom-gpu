@@ -5,8 +5,10 @@ RGBA8 buffer with a solid colour plus a deterministic two-stop vertical
 gradient, reads the buffer back, and compares its bytes against an independent
 CPU reference. In R6 it also **executes the exact display list dumped by
 `opurom-render --commands`** with a Metal compute kernel and writes a P6 PPM
-that is byte-identical to the independent software renderer. This folder is its
-own git repository. All files and comments are English.
+that is byte-identical to the independent software renderer. R9 adds real MSL
+compute kernels for the five R8 visual effects (blur, shadow, glow, glass,
+liquid), with a second cross-repo byte-equality proof for effect IR. This folder
+is its own git repository. All files and comments are English.
 
 ## Scope
 
@@ -30,9 +32,14 @@ Implemented now:
 - `raster <commands.json> <out.ppm>`: parses the renderer's deterministic
   display-list JSON with a standard-library parser (no new crate), packs the
   commands into a `device const uint*` buffer, uploads the output RGBA buffer,
-  dispatches one Metal thread per viewport pixel over `raster_display_list`,
-  reads the result back, and writes the renderer's exact P6 PPM format
+  dispatches one Metal thread per viewport pixel over `raster_batch`, reads the
+  result back, and writes the renderer's exact P6 PPM format
   (`P6\n<w> <h>\n255\n` + RGB triplets).
+- R9 effect commands: `snapshot_frame`, `build_mask`, `effect_local` and the
+  two `blur_*` kernels run as separate committed compute passes over two
+  ping-pong RGBA frame buffers, one backdrop snapshot and one silhouette-mask
+  buffer. Each pass dispatches one thread per pixel; the final buffer is read
+  back on the CPU.
 
 The pixel contract is opaque RGBA8. An inset border uses the solid colour; the
 interior uses the same fixed-point two-stop vertical gradient arithmetic as
@@ -81,6 +88,53 @@ no dirty-rect integration, no Vulkan/ANGLE/D3D backend, no device conformance
 matrix and no fps claim. `dispatch_ms` remains host-side commit-to-completion
 latency, not an fps measurement.
 
+## R9 GPU effect kernels and byte-equality proof
+
+`opurom-render --commands` now emits optional effect commands with integer
+parameters for IR carrying the five R8 effects. Effect-free streams stay
+byte-identical to R6. The seven R9 command kinds are:
+
+| Kind | Integer parameters | Metal pass |
+| --- | --- | --- |
+| `effect_backdrop` | none | `snapshot_frame`: copy the current frame to a backdrop buffer |
+| `effect_mask` | rect, clip, padded bounds, shape radius, shape flag | `build_mask`: rounded silhouette or frame/backdrop diff |
+| `effect_shadow` | bounds, radius, dx, dy, fixed-point alpha, colour | `effect_local` with a two-pass softened mask |
+| `effect_glow` | bounds, radius, alpha, colour | `effect_local` with a two-pass softened mask |
+| `effect_glass` | rect, clip, bounds, shape radius, radius, alpha, colour | `effect_local` with a two-pass blurred backdrop |
+| `effect_liquid` | rect, clip, bounds, shape radius, denom, alpha, colour | `effect_local` with the integer specular band |
+| `effect_blur` | radius | `blur_horizontal` + `blur_vertical` over the whole frame |
+
+All arithmetic is integer and mirrors the software renderer exactly: box-blur
+half-up rounding, `(src*a + dst*(255-a) + 127)/255` effect blending, clamped
+edge windows and the same pre-order draw order. Regular commands are packed into
+batches; a separate committed command buffer per pass guarantees that each pass
+sees the previous pass's writes.
+
+The committed effect fixture is
+`../opurom-render/tests/fixtures/r9_effect.opuir.json` (all five effects).
+`tests/r9.rs` runs both binaries and the system `cmp`:
+
+```sh
+../opurom-render/target/debug/opurom-render \
+  ../opurom-render/tests/fixtures/r9_effect.opuir.json 96 64 cpu.ppm \
+  --commands fx.commands.json      # digest=eb9ce1cec41bac13, dirty=1
+./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
+cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
+```
+
+Measured result: `cmp` exits 0, both PPMs are 18445 bytes, and the FNV-1a 64
+digest of the PPM bytes is `b493cd0714a4fb64`. The same test also proves
+equality at `64 48` (9229 bytes, PPM digest `70d42c01f7ee35b2`). This is a real
+comparison against the independent software renderer, not a self-comparison.
+If the sibling renderer binary or fixture is absent, the test prints a clear
+`SKIP` message and claims no success.
+
+**Honest scope:** compute kernels only. No GPU presentation to a window, no GPU
+text (glyphs remain CPU-decomposed solid rects), no Vulkan/ANGLE/D3D backend,
+no device conformance matrix and no fps claim. `dispatch_ms` remains host-side
+commit-to-completion latency. Non-macOS hosts return the documented
+`MetalUnavailable` error and the tests print `SKIP`.
+
 ## Commands
 
 ```sh
@@ -128,23 +182,26 @@ cargo build --offline
 
 Metal dependencies appear only under
 `[target.'cfg(target_os = "macos")'.dependencies]` in `Cargo.toml`. Linux CI
-therefore builds and tests the pure-Rust parser, reference, validation, digest
-and error paths without Metal frameworks or Metal crates. On non-macOS, GPU
-commands return the documented `MetalUnavailable` error and exit nonzero;
-tests print a clear `SKIP` message (visible with
-`cargo test --offline -- --nocapture`) and assert that no fake success occurs.
-On macOS, `tests/display.rs` performs the cross-repo `cmp` proof described
-above; GPU execution cannot be validated by Linux CI.
+therefore builds and tests the pure-Rust parser, packer, pass builder,
+reference, validation, digest and error paths without Metal frameworks or Metal
+crates; `cargo check --tests --target x86_64-unknown-linux-gnu` is clean with
+`-D warnings`. On non-macOS, GPU commands return the documented
+`MetalUnavailable` error and exit nonzero; tests print a clear `SKIP` message
+(visible with `cargo test --offline -- --nocapture`) and assert that no fake
+success occurs. On macOS, `cargo test --offline` runs 27 tests, including the
+two cross-repo `cmp` proofs in `tests/display.rs` and `tests/r9.rs`; GPU
+execution cannot be validated by Linux CI.
 
-## Honest limits / R6+
+## Honest limits / R9+
 
-This is display-list fill/gradient work over rects. Glyph shapes reach the GPU
-only as CPU-decomposed rectangles. It is **not** a full GPU UI rasterizer. There
-is no Vulkan, ANGLE, D3D, Metal presentation, texture atlas, glyph rendering,
-image decoding, or dirty-rect integration. There is no measured 120 fps claim,
-no benchmark claim, and no device conformance matrix: only the system default
-Metal device is queried. Other backends, presentation, GPU text and
-multi-device certification remain R7+ work.
+This is headless display-list work over rects plus five framebuffer effect
+kernels. Glyph shapes reach the GPU only as CPU-decomposed rectangles. It is
+**not** a full GPU UI rasterizer. There is no Vulkan, ANGLE, D3D, Metal
+presentation, texture atlas, glyph rendering, image decoding, or dirty-rect
+integration. There is no measured 120 fps claim, no benchmark claim, and no
+device conformance matrix: only the system default Metal device is queried.
+Other backends, presentation, GPU text and multi-device certification remain
+R10+ work.
 No Metal API call in this backend is substituted with a software stub; the only
 software implementation is the explicitly separate CPU parsing/oracle path used
 for unit tests, while `raster` always performs the Metal dispatch on macOS.
