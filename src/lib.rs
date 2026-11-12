@@ -1,16 +1,26 @@
-//! Deterministic RGBA8 Metal compute backend for OPUROM R5.
+//! Deterministic RGBA8 Metal compute backend for OPUROM R6.
 //!
 //! The CPU reference and the MSL kernel share an integer pixel contract. Metal
 //! code is compiled only on macOS; other targets return `MetalUnavailable`.
+//!
+//! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
+//! display list to a Metal compute kernel. Text glyph compositing stays CPU-side
+//! in R6: the kernel executes solid rects, rounded rects and two-stop gradients
+//! only.
 
 use std::fmt;
 use std::time::Duration;
 
+mod display;
 mod reference;
 
 #[cfg(target_os = "macos")]
 mod metal;
 
+pub use display::{
+    parse_display_list, render_cpu_commands, Command, DisplayList, COMMAND_WORDS, COORD_BIAS,
+    MAX_COMMANDS as MAX_DISPLAY_COMMANDS,
+};
 pub use reference::{render_cpu, Rgb};
 
 /// Bound one host allocation and keeps the MSL thread index in `uint` range.
@@ -111,6 +121,7 @@ pub enum GpuError {
     /// Documented fallback when the host cannot expose a Metal device.
     MetalUnavailable(String),
     InvalidParameters(String),
+    InvalidDisplayList(String),
     Metal(String),
     Mismatch {
         width: u32,
@@ -133,6 +144,7 @@ impl fmt::Display for GpuError {
         match self {
             Self::MetalUnavailable(message) => write!(f, "MetalUnavailable: {message}"),
             Self::InvalidParameters(message) => write!(f, "InvalidParameters: {message}"),
+            Self::InvalidDisplayList(message) => write!(f, "InvalidDisplayList: {message}"),
             Self::Metal(message) => write!(f, "Metal error: {message}"),
             Self::Mismatch {
                 width,
@@ -196,6 +208,79 @@ pub fn render(params: &FrameParams) -> Result<GpuFrame, GpuError> {
         let _ = byte_count;
         Err(GpuError::metal_unavailable())
     }
+}
+
+/// Validate a display-list viewport and return its RGBA byte count.
+pub fn display_byte_count(width: u32, height: u32) -> Result<usize, GpuError> {
+    if width == 0 || height == 0 {
+        return Err(GpuError::InvalidParameters(
+            "display-list width and height must be positive".to_owned(),
+        ));
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(GpuError::InvalidParameters(format!(
+            "display-list dimensions must not exceed {MAX_DIMENSION}"
+        )));
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > u64::from(u32::MAX) {
+        return Err(GpuError::InvalidParameters(
+            "thread count exceeds the MSL uint range".to_owned(),
+        ));
+    }
+    pixels
+        .checked_mul(4)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            GpuError::InvalidParameters("display-list RGBA byte count overflow".to_owned())
+        })
+}
+
+/// Execute one parsed display list on the Metal compute device.
+pub fn raster_display(list: &DisplayList) -> Result<GpuFrame, GpuError> {
+    let byte_count = display_byte_count(list.width, list.height)?;
+    let packed = list.pack()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        metal::raster(list, &packed, byte_count)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (packed, byte_count);
+        Err(GpuError::metal_unavailable())
+    }
+}
+
+/// Render one parsed display list with Metal and encode the readback as P6.
+pub fn raster_display_ppm(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
+    let frame = raster_display(list)?;
+    ppm_bytes(list.width, list.height, &frame.pixels)
+}
+
+/// Encode RGBA8 pixels in the renderer's exact P6 PPM format.
+pub fn ppm_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, GpuError> {
+    let byte_count = display_byte_count(width, height)?;
+    if rgba.len() != byte_count {
+        return Err(GpuError::InvalidParameters(format!(
+            "RGBA length {} does not match {byte_count}",
+            rgba.len()
+        )));
+    }
+    let header = format!("P6\n{width} {height}\n255\n");
+    let mut ppm = Vec::with_capacity(header.len() + width as usize * height as usize * 3);
+    ppm.extend_from_slice(header.as_bytes());
+    for pixel in rgba.chunks_exact(4) {
+        ppm.extend_from_slice(&pixel[..3]);
+    }
+    Ok(ppm)
+}
+
+/// Parse and execute `commands.json`, then encode the GPU PPM bytes.
+pub fn raster_json_ppm(json: &str) -> Result<Vec<u8>, GpuError> {
+    let list = parse_display_list(json)?;
+    raster_display_ppm(&list)
 }
 
 pub fn probe_output() -> Result<String, GpuError> {
