@@ -1,4 +1,5 @@
 //! capability display-list raster tests: Metal/software equality and CLI error paths.
+//! The capability effect equality proof lives in `tests/capability.rs`.
 //!
 //! The cross-repo test locates the sibling `opurom-render` binary, renders the
 //! rect/gradient fixture and the golden counter frame with `--commands`, then

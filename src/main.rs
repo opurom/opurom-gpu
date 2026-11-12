@@ -1,5 +1,5 @@
-//! CLI: `probe`, `self-test`, and the capability `raster <commands.json> <out.ppm>`
-//! display-list execution command.
+//! CLI: `probe`, `self-test`, and the capability/capability `raster <commands.json> <out.ppm>`
+//! display-list and effect execution command.
 
 use std::{env, fs, process};
 
