@@ -1,0 +1,36 @@
+[package]
+name = "opurom-gpu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.5", default-features = false, features = ["std"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSBundle",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSRange",
+    "NSString",
+    "NSURL",
+] }
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDefines",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLPipeline",
+    "MTLResource",
+    "MTLTypes",
+] }
