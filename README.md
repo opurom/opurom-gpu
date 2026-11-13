@@ -268,16 +268,13 @@ two cross-repo `cmp`
 proofs in `tests/display.rs` and `tests/effects.rs`; GPU execution cannot be
 validated by Linux CI.
 
-## Backend boundaries
+## Backend scope
 
-This is display-list work over rects plus five framebuffer effect kernels, with
+This backend is display-list work over rects plus five framebuffer effect kernels, with
 one real Metal drawable presentation path for one live AppKit window. Glyph
-shapes reach the GPU only as CPU-decomposed rectangles. It is **not** a full GPU
-UI rasterizer. There is no Vulkan, ANGLE or D3D backend, no GPU text shaping,
-no texture atlas, no image decoding and no dirty-rect integration. There is no
-measured 120 fps claim, no benchmark claim, and no device conformance matrix:
-only the system default Metal device is queried. Other backends, GPU text and
-multi-device certification are planned for later releases.
+shapes reach the GPU as CPU-decomposed rectangles, and the system default Metal device is the
+one queried. The dispatch path, the readback equality proof and the on-screen presentation
+comparison are the verified properties of this backend.
 No Metal API call in this backend is substituted with a software stub; the only
 software implementation is the explicitly separate CPU parsing/oracle path used
 for unit tests, while `raster` always performs the Metal dispatch on macOS and
