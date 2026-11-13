@@ -76,7 +76,7 @@ kernel void fill_gradient_rgba8(
 }
 "#;
 
-// R9 raster kernels: batches of regular commands plus real effect passes.
+// Raster kernels: batches of regular commands plus real effect passes.
 // One thread per viewport pixel; passes run in command order on the frame buffer.
 const RASTER_KERNEL_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -126,7 +126,7 @@ static inline bool inside_shape(long rx, long ry, long rw, long rh, long rad, lo
     return !outside_round(rx, ry, rw, rh, rad, x, y);
 }
 
-// R6 regular-command blend: integer /255 without half-up rounding.
+// Regular-command blend: integer /255 without half-up rounding.
 static inline uchar4 blend_px(uchar4 dst, uchar4 src) {
     if (src.w == 0) return dst;
     if (src.w == 255) return src;
@@ -140,7 +140,7 @@ static inline uchar4 blend_px(uchar4 dst, uchar4 src) {
     );
 }
 
-// R8 effect blend: integer half-up (src * a + dst * (255 - a) + 127) / 255.
+// Effect blend: integer half-up (src * a + dst * (255 - a) + 127) / 255.
 static inline uchar blend_add(uchar s, uchar d, long a) {
     return clamp_u8((long(s) * a + long(d) * (255L - a) + 127L) / 255L);
 }
@@ -454,7 +454,7 @@ fn require_system_device<T>(device: Option<T>) -> Result<T, GpuError> {
     })
 }
 
-/// The live R9 compute output, kept on the Metal device for presentation.
+/// The live compute output, kept on the Metal device for presentation.
 pub(super) struct RasterFrame {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -537,7 +537,7 @@ pub(super) fn render(params: &FrameParams, byte_count: usize) -> Result<GpuFrame
         encoder.setBytes_length_atIndex(kernel_bytes, size_of::<[u32; 6]>(), 1);
         encoder.setBuffer_offset_atIndex(Some(&*buffer), 0, 0);
     }
-    // shortcut: one 1D thread per pixel, upgrade to 2D tiling with the full rasterizer in R6+.
+    // shortcut: one 1D thread per pixel, upgrade to 2D tiling with the full rasterizer.
     encoder.dispatchThreads_threadsPerThreadgroup(
         MTLSize {
             width: pixel_count,
@@ -601,7 +601,7 @@ pub(super) fn raster(
     })
 }
 
-/// Execute the same R9 passes but retain the final GPU buffer for a blit.
+/// Execute the same passes but retain the final GPU buffer for a blit.
 pub(super) fn raster_buffer(
     packed_commands: &[u32],
     passes: &[Pass],

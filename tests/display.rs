@@ -1,5 +1,5 @@
-//! R6 display-list raster tests: Metal/software equality and CLI error paths.
-//! The R9 effect equality proof lives in `tests/r9.rs`.
+//! Display-list raster tests: Metal/software equality and CLI error paths.
+//! The effect equality proof lives in `tests/effects.rs`.
 //!
 //! The cross-repo test locates the sibling `opurom-render` binary, renders the
 //! rect/gradient fixture and the golden counter frame with `--commands`, then
@@ -52,9 +52,9 @@ fn assert_cross_repo_byte_equality(
     label: &str,
 ) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let cpu_ppm = dir.join(format!("r6-{label}-cpu.ppm"));
-    let gpu_ppm = dir.join(format!("r6-{label}-gpu.ppm"));
-    let commands = dir.join(format!("r6-{label}.commands.json"));
+    let cpu_ppm = dir.join(format!("display-{label}-cpu.ppm"));
+    let gpu_ppm = dir.join(format!("display-{label}-gpu.ppm"));
+    let commands = dir.join(format!("display-{label}.commands.json"));
 
     let render = Command::new(renderer)
         .arg(ir_path)
@@ -148,8 +148,8 @@ fn gpu_ppm_is_byte_identical_to_independent_software_renderer() {
 #[test]
 fn raster_cli_error_paths_are_readable() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let missing = dir.join("r6-does-not-exist.json");
-    let bad_json = dir.join("r6-bad.json");
+    let missing = dir.join("display-does-not-exist.json");
+    let bad_json = dir.join("display-bad.json");
     fs::write(&bad_json, "{\"version\":1,").unwrap();
 
     let run = |args: &[&str]| {
@@ -192,7 +192,7 @@ fn raster_cli_error_paths_are_readable() {
 #[test]
 fn raster_rejects_unwritable_output_path() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let json = dir.join("r6-ok.commands.json");
+    let json = dir.join("display-ok.commands.json");
     fs::write(
         &json,
         r#"{"version":1,"width":2,"height":1,"background":[1,2,3,255],"commands":[]}"#,

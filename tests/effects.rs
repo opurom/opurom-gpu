@@ -1,4 +1,4 @@
-//! R9 cross-repo GPU/CPU visual-equality proof for the five effect kernels.
+//! Cross-repo GPU/CPU visual-equality proof for the five effect kernels.
 //!
 //! This test runs the independent software renderer on a committed effect IR,
 //! dumps its command stream, executes that stream with `opurom-gpu raster`, and
@@ -36,9 +36,9 @@ fn skip(message: &str) {
 #[cfg(target_os = "macos")]
 fn assert_effect_byte_equality(renderer: &Path, ir: &Path, width: &str, height: &str, label: &str) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let cpu_ppm = dir.join(format!("r9-{label}-cpu.ppm"));
-    let gpu_ppm = dir.join(format!("r9-{label}-gpu.ppm"));
-    let commands = dir.join(format!("r9-{label}.commands.json"));
+    let cpu_ppm = dir.join(format!("effects-{label}-cpu.ppm"));
+    let gpu_ppm = dir.join(format!("effects-{label}-gpu.ppm"));
+    let commands = dir.join(format!("effects-{label}.commands.json"));
 
     let render = Command::new(renderer)
         .arg(ir)
@@ -118,13 +118,13 @@ fn effect_gpu_ppm_is_byte_identical_to_independent_software_renderer() {
     let Some(renderer) = sibling_renderer() else {
         skip(
             "sibling opurom-render binary not found at ../opurom-render/target/debug/opurom-render \
-             (set OPUROM_RENDER_BIN); cannot run the R9 effect byte-equality proof",
+             (set OPUROM_RENDER_BIN); cannot run the effect byte-equality proof",
         );
         return;
     };
     let ir = Path::new(EFFECT_IR);
     if !ir.is_file() {
-        skip("committed R9 effect IR fixture ../opurom-render/tests/fixtures/r9_effect.opuir.json not found");
+        skip("committed effect IR fixture ../opurom-render/tests/fixtures/r9_effect.opuir.json not found");
         return;
     }
     assert_effect_byte_equality(&renderer, ir, "96", "64", "all-five-effects");
@@ -135,7 +135,7 @@ fn effect_gpu_ppm_is_byte_identical_to_independent_software_renderer() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn effect_gpu_ppm_is_byte_identical_to_independent_software_renderer() {
-    skip("R9 effect byte equality requires macOS Metal; asserting MetalUnavailable instead");
+    skip("effect byte equality requires macOS Metal; asserting MetalUnavailable instead");
     let json = r#"{"version":1,"width":2,"height":2,"background":[0,0,0,255],"commands":[{"kind":"effect_blur","radius":1}]}"#;
     assert!(matches!(
         opurom_gpu::raster_json_ppm(json),

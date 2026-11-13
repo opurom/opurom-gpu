@@ -1,5 +1,5 @@
-//! Standard-library parser, packer and CPU unit oracle for R6 display lists and
-//! R9 effect commands.
+//! Standard-library parser, packer and CPU unit oracle for display lists and
+//! effect commands.
 //!
 //! This module never substitutes for Metal. `raster` returns MetalUnavailable
 //! off macOS; the CPU interpreter below covers regular commands only and is for
@@ -14,7 +14,7 @@ pub const COMMAND_WORDS: usize = 16;
 pub const COORD_BIAS: i64 = 1 << 30;
 pub const COORD_LIMIT: i64 = 500_000_000;
 
-/// R9 effect parameter bounds, shared with opurom-render's R8 schema.
+/// Effect parameter bounds, shared with opurom-render's effect schema.
 pub const EFFECT_MAX_RADIUS: i64 = 32;
 pub const EFFECT_MAX_OFFSET: i64 = 64;
 pub const EFFECT_UNIT: i64 = 1024;
@@ -381,7 +381,7 @@ pub(crate) fn pack_rgba(color: [u8; 4]) -> u32 {
 fn encode_coord(value: i64, what: &str) -> Result<u32, GpuError> {
     if !(-COORD_LIMIT..=COORD_LIMIT).contains(&value) {
         return Err(GpuError::InvalidDisplayList(format!(
-            "{what} coordinate {value} exceeds the R6 integer range"
+            "{what} coordinate {value} exceeds the integer range"
         )));
     }
     Ok((value + COORD_BIAS) as u32)
@@ -617,7 +617,7 @@ fn validate_geometry(
     for value in rect.iter().chain(clip.iter()).chain([radius].iter()) {
         if !(-COORD_LIMIT..=COORD_LIMIT).contains(value) {
             return Err(GpuError::InvalidDisplayList(format!(
-                "coordinate {value} exceeds the R6 integer range"
+                "coordinate {value} exceeds the integer range"
             )));
         }
     }
@@ -689,7 +689,7 @@ fn effect_color(color: [u8; 4]) -> Result<(), GpuError> {
     Ok(())
 }
 
-/// Validate an R9 effect command at the parser trust boundary.
+/// Validate an effect command at the parser trust boundary.
 fn validate_effect(command: &Command, width: u32, height: u32) -> Result<(), GpuError> {
     let mut rect = [0i64; 4];
     let mut clip = [0i64; 4];

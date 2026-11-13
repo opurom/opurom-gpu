@@ -1,12 +1,13 @@
-//! Deterministic RGBA8 Metal compute backend for OPUROM R6.
+//! Deterministic RGBA8 Metal compute backend for OPUROM.
 //!
 //! The CPU reference and the MSL kernel share an integer pixel contract. Metal
 //! code is compiled only on macOS; other targets return `MetalUnavailable`.
 //!
 //! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
-//! display list to Metal compute kernels. R9 adds five effect command types:
-//! blur, shadow, glow, glass and liquid execute as real multi-pass MSL kernels
-//! with frame snapshots and readback. R10 retains the final compute buffer and
+//! display list to Metal compute kernels. Five effect command types are
+//! supported: blur, shadow, glow, glass and liquid execute as real multi-pass
+//! MSL kernels with frame snapshots and readback. The presentation path retains
+//! the final compute buffer and
 //! presents it through a real CAMetalLayer drawable from the platform's live
 //! window. Text glyph compositing stays CPU-side: glyphs reach the GPU only as
 //! pre-decomposed solid rectangles.

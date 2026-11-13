@@ -1,8 +1,8 @@
-//! R10: present the live R9 compute buffer into a real `CAMetalLayer`.
+//! Present the live compute buffer into a real `CAMetalLayer`.
 //!
 //! The platform adapter loads this crate's cdylib at runtime and passes the
 //! window layer as an opaque Objective-C object pointer. No CPU image is used
-//! as a substitute: the final R9 `MTLBuffer` is copied into the drawable
+//! as a substitute: the final `MTLBuffer` is copied into the drawable
 //! texture with a real `MTLBlitCommandEncoder`, then committed and presented.
 
 use std::ffi::{c_char, c_int, c_void};
@@ -222,7 +222,7 @@ fn present_impl(json: &str, layer: *mut c_void) -> Result<(), GpuError> {
     encode_presentation(&mut encoder, copy)?;
 
     // The presented drawable's own IOSurface is exposed as the layer contents:
-    // R7's `cacheDisplay(in:to:)` re-renders the layer tree offscreen and
+    // `cacheDisplay(in:to:)` re-renders the layer tree offscreen and
     // cannot see window-server drawable content (it renders blank). This is
     // the exact zero-copy surface the Metal blit wrote and the window server
     // presents, never a CPU re-render or a second drawable substitute.
