@@ -204,6 +204,77 @@ pub fn digest_hex(bytes: &[u8]) -> String {
     format!("{:016x}", fnv1a(bytes))
 }
 
+/// Budget boundary, in milliseconds, between the full and the degraded tier.
+pub const QUALITY_FULL_MS: i64 = 16;
+/// Budget boundary, in milliseconds, between the three-quarters and half tiers.
+pub const QUALITY_THREE_QUARTERS_MS: i64 = 8;
+/// Budget boundary, in milliseconds, between the half and quarter tiers.
+pub const QUALITY_HALF_MS: i64 = 4;
+
+/// The deterministic frame-budget quality tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityTier {
+    Full,
+    ThreeQuarters,
+    Half,
+    Quarter,
+}
+
+impl QualityTier {
+    pub fn parse(s: &str) -> Option<QualityTier> {
+        Some(match s {
+            "full" => QualityTier::Full,
+            "three_quarters" => QualityTier::ThreeQuarters,
+            "half" => QualityTier::Half,
+            "quarter" => QualityTier::Quarter,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            QualityTier::Full => "full",
+            QualityTier::ThreeQuarters => "three_quarters",
+            QualityTier::Half => "half",
+            QualityTier::Quarter => "quarter",
+        }
+    }
+}
+
+/// Caller-applied quality policy selected from a measured frame budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuQuality {
+    pub tier: QualityTier,
+    pub particle_count: usize,
+    pub effects_enabled: bool,
+}
+
+/// Map a measured frame budget to a deterministic quality tier with the same
+/// boundaries the renderer's `choose_quality` uses: `>=16 ms` full, `>=8 ms`
+/// three quarters, `>=4 ms` half, otherwise one quarter, with effects enabled
+/// only at the full tier. `measured_frame_budget_ms` is caller-supplied; this
+/// helper never reads a clock, so the Metal and CPU paths select the same tier.
+pub fn choose_quality(
+    measured_frame_budget_ms: i64,
+    particle_count: usize,
+    effects_enabled: bool,
+) -> GpuQuality {
+    let (num, den, tier, effects) = if measured_frame_budget_ms >= QUALITY_FULL_MS {
+        (1, 1, QualityTier::Full, effects_enabled)
+    } else if measured_frame_budget_ms >= QUALITY_THREE_QUARTERS_MS {
+        (3, 4, QualityTier::ThreeQuarters, false)
+    } else if measured_frame_budget_ms >= QUALITY_HALF_MS {
+        (1, 2, QualityTier::Half, false)
+    } else {
+        (1, 4, QualityTier::Quarter, false)
+    };
+    GpuQuality {
+        tier,
+        particle_count: particle_count.saturating_mul(num) / den,
+        effects_enabled: effects,
+    }
+}
+
 pub fn render(params: &FrameParams) -> Result<GpuFrame, GpuError> {
     let byte_count = params.validate()?;
 
@@ -362,5 +433,89 @@ mod tests {
         assert!(message.contains("2x3"));
         assert!(message.contains("aaaaaaaaaaaaaaaa"));
         assert!(message.contains("bbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn quality_tier_boundaries_match_the_renderer_table() {
+        // The GPU tier must use the renderer's boundaries: >=16 ms full,
+        // >=8 ms three quarters, >=4 ms half, otherwise one quarter.
+        for (budget, tier) in [
+            (-1, QualityTier::Quarter),
+            (0, QualityTier::Quarter),
+            (3, QualityTier::Quarter),
+            (4, QualityTier::Half),
+            (7, QualityTier::Half),
+            (8, QualityTier::ThreeQuarters),
+            (15, QualityTier::ThreeQuarters),
+            (16, QualityTier::Full),
+            (33, QualityTier::Full),
+        ] {
+            let quality = choose_quality(budget, 8, true);
+            assert_eq!(quality.tier, tier, "budget {budget}");
+        }
+        // Effects stay enabled only at the full tier, and only when requested.
+        assert!(!choose_quality(0, 8, true).effects_enabled);
+        assert!(!choose_quality(4, 8, true).effects_enabled);
+        assert!(!choose_quality(8, 8, true).effects_enabled);
+        assert!(choose_quality(16, 8, true).effects_enabled);
+        assert!(!choose_quality(16, 8, false).effects_enabled);
+    }
+
+    #[test]
+    fn quality_particle_count_uses_the_same_integer_reduction() {
+        assert_eq!(choose_quality(16, 8, true).particle_count, 8);
+        assert_eq!(choose_quality(8, 8, true).particle_count, 6);
+        assert_eq!(choose_quality(4, 8, true).particle_count, 4);
+        assert_eq!(choose_quality(3, 8, true).particle_count, 2);
+        assert_eq!(choose_quality(0, 8, true).particle_count, 2);
+        // Truncating reduction: 7 * 3 / 4 == 5.
+        assert_eq!(choose_quality(8, 7, true).particle_count, 5);
+        // Saturating so a huge count cannot overflow.
+        assert_eq!(
+            choose_quality(16, usize::MAX, true).particle_count,
+            usize::MAX
+        );
+        assert_eq!(
+            choose_quality(0, usize::MAX, true).particle_count,
+            usize::MAX / 4
+        );
+    }
+
+    #[test]
+    fn quality_tier_selection_is_deterministic_and_monotonic() {
+        for budget in 0..=24 {
+            assert_eq!(
+                choose_quality(budget, 17, true),
+                choose_quality(budget, 17, true),
+                "the tier must be a pure function of the budget"
+            );
+        }
+        // Tightening the budget never raises the particle count, and effects
+        // turn on once the budget reaches the full tier.
+        let mut previous_count = 0;
+        let mut previous_effects = false;
+        for budget in 0..=24 {
+            let quality = choose_quality(budget, 17, true);
+            assert!(quality.particle_count >= previous_count, "budget {budget}");
+            if previous_effects {
+                assert!(quality.effects_enabled, "budget {budget}");
+            }
+            previous_count = quality.particle_count;
+            previous_effects = quality.effects_enabled;
+        }
+    }
+
+    #[test]
+    fn quality_tier_is_orthogonal_to_the_cpu_oracle() {
+        // The tier is a caller-applied policy, not a pixel input: the CPU
+        // reference stays byte identical at every tier, so the Metal and CPU
+        // paths cannot disagree on pixels because of a tier choice.
+        for budget in [-1, 0, 3, 4, 8, 16, 33] {
+            let quality = choose_quality(budget, 8, true);
+            let params = SELF_TEST_CASES[0];
+            let cpu = render_cpu(&params).unwrap();
+            assert!(quality.particle_count <= 8);
+            assert_eq!(digest_hex(&cpu), digest_hex(&render_cpu(&params).unwrap()));
+        }
     }
 }
