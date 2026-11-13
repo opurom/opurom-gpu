@@ -319,8 +319,21 @@ fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>
 }
 
 impl DisplayList {
+    /// Public fields bypass the parser, so recheck bounds on every execution path.
+    fn validate(&self) -> Result<(), GpuError> {
+        for command in &self.commands {
+            if let Some((rect, clip, radius)) = command.geometry() {
+                validate_geometry(rect, clip, radius, self.width, self.height)?;
+            } else {
+                validate_effect(command, self.width, self.height)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Pack regular commands and build the ordered Metal pass list.
     pub fn build_passes(&self) -> Result<(Vec<u32>, Vec<Pass>), GpuError> {
+        self.validate()?;
         let mut words = Vec::with_capacity(self.commands.len() * COMMAND_WORDS);
         let background = pack_rgba(self.background);
         let mut clear = base_params(self.width, self.height);
@@ -441,6 +454,7 @@ fn blend(pixel: &mut [u8], src: [u8; 4]) {
 /// executed by Metal; the real `raster` never calls this on a non-Metal host.
 pub fn render_cpu_commands(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
     let byte_count = crate::display_byte_count(list.width, list.height)?;
+    list.validate()?;
     let mut pixels = Vec::with_capacity(byte_count);
     for _ in 0..(u64::from(list.width) * u64::from(list.height)) {
         pixels.extend_from_slice(&[
@@ -1340,5 +1354,161 @@ mod tests {
         let outside = "{\"kind\":\"effect_shadow\",\"bounds\":[-1,0,4,4],\"radius\":0,\"dx\":0,\"dy\":0,\"alpha\":0,\"color\":[0,0,0,255]}";
         let error = parse_display_list(&header(8, 4, [0, 0, 0, 255], outside)).unwrap_err();
         assert!(error.to_string().contains("normalized"), "{error}");
+    }
+
+    #[test]
+    fn strict_parser_bounds_report_clear_errors_without_panicking() {
+        let range_case = format!(
+            "{{\"kind\":\"solid\",\"rect\":[0,0,{},1],\"clip\":[0,0,8,4],\"color\":[1,2,3,255]}}",
+            COORD_LIMIT + 1
+        );
+        let cases: &[(&str, &str)] = &[
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[-1,0,2,2],\"color\":[1,2,3,255]}",
+                "clip must be normalized",
+            ),
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[0,0,9,2],\"color\":[1,2,3,255]}",
+                "clip extends outside the viewport",
+            ),
+            (
+                "{\"kind\":\"effect_shadow\",\"bounds\":[-1,0,4,4],\"radius\":1,\"dx\":0,\"dy\":0,\"alpha\":0,\"color\":[0,0,0,255]}",
+                "bounds must be normalized",
+            ),
+            (
+                "{\"kind\":\"effect_glow\",\"bounds\":[0,0,9,4],\"radius\":1,\"alpha\":0,\"color\":[0,0,0,255]}",
+                "bounds extends outside the viewport",
+            ),
+            (&range_case, "exceeds the integer range"),
+            (
+                "{\"kind\":\"triangle\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"color\":[1,2,3,255]}",
+                "unsupported command kind",
+            ),
+            ("{\"kind\":\"effect_warp\"}", "unsupported command kind"),
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"color\":[256,0,0,255]}",
+                "color must be 0..=255",
+            ),
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"color\":[-1,0,0,255]}",
+                "color must be 0..=255",
+            ),
+            (
+                "{\"kind\":\"effect_glow\",\"bounds\":[0,0,8,4],\"radius\":1,\"alpha\":0,\"color\":[1,2,3,256]}",
+                "color must be 0..=255",
+            ),
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"color\":[1,2,3",
+                "expected ',' in color",
+            ),
+            (
+                "{\"kind\":\"solid\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"color\":[1,2,3,255]",
+                "expected '}' after solid command",
+            ),
+            (
+                "{\"kind\":\"rounded\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":1,\"color\":[]}",
+                "expected an integer",
+            ),
+        ];
+        for (index, (command, expected)) in cases.iter().enumerate() {
+            let json = header(8, 4, [0, 0, 0, 255], command);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse_display_list(&json)
+            }));
+            let error = match result {
+                Ok(Err(error)) => error,
+                Ok(Ok(_)) => panic!("case {index} was accepted"),
+                Err(_) => panic!("case {index} panicked"),
+            };
+            assert!(
+                matches!(error, GpuError::InvalidDisplayList(_)),
+                "case {index}: {error}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "case {index}: {error} must mention {expected:?}"
+            );
+        }
+        let background =
+            "{\"version\":1,\"width\":1,\"height\":1,\"background\":[0,0,0,256],\"commands\":[]}";
+        assert!(parse_display_list(background)
+            .unwrap_err()
+            .to_string()
+            .contains("background must be 0..=255"));
+        let truncated = "{\"version\":1,\"width\":8,\"height\":4,\"background\":[0,0,0,255],\"commands\":[{\"kind\":\"gradient\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":0,\"top\":[0,0,0,255]";
+        assert!(parse_display_list(truncated)
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of JSON"));
+    }
+
+    #[test]
+    fn valid_streams_keep_byte_identical_packed_and_pixel_output() {
+        let parsed = parse_display_list(&header(4, 2, [0, 0, 0, 255], SOLID_CLIPPED)).unwrap();
+        let mut expected_words = vec![SOLID];
+        for value in [-2i64, -1, 5, 3, 0, 0, 4, 2, 0] {
+            expected_words.push((value + COORD_BIAS) as u32);
+        }
+        expected_words.push(pack_rgba([200, 100, 50, 128]));
+        expected_words.extend_from_slice(&[0u32; COMMAND_WORDS - 11]);
+        assert_eq!(parsed.pack().unwrap(), expected_words);
+        let constructed = DisplayList {
+            width: 4,
+            height: 2,
+            background: [0, 0, 0, 255],
+            commands: vec![Command::Solid {
+                rect: [-2, -1, 5, 3],
+                clip: [0, 0, 4, 2],
+                color: [200, 100, 50, 128],
+            }],
+        };
+        assert_eq!(constructed, parsed);
+        assert_eq!(constructed.pack().unwrap(), expected_words);
+        let mut expected_pixels = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                expected_pixels.extend_from_slice(if x < 3 {
+                    &[100, 50, 25, 255]
+                } else {
+                    &[0, 0, 0, 255]
+                });
+            }
+        }
+        assert_eq!(render_cpu_commands(&parsed).unwrap(), expected_pixels);
+        assert_eq!(render_cpu_commands(&constructed).unwrap(), expected_pixels);
+
+        let first = "{\"kind\":\"gradient\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[100,100,100,255],\"alpha\":255}";
+        let second = "{\"kind\":\"gradient\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":0,\"top\":[200,0,0,255],\"bottom\":[0,0,200,255],\"alpha\":255}";
+        let gradients =
+            parse_display_list(&header(2, 2, [0, 0, 0, 255], &format!("{first},{second}")))
+                .unwrap();
+        assert_eq!(
+            render_cpu_commands(&gradients).unwrap(),
+            vec![200, 0, 0, 255, 200, 0, 0, 255, 1, 0, 200, 255, 1, 0, 200, 255]
+        );
+
+        let effects = parse_display_list(&header(16, 8, [0, 0, 0, 255], EFFECT_STREAM)).unwrap();
+        assert!(effects.pack().unwrap().is_empty());
+        let kernels: Vec<u32> = effects
+            .build_passes()
+            .unwrap()
+            .1
+            .iter()
+            .map(|pass| pass.kernel)
+            .collect();
+        assert_eq!(
+            kernels,
+            vec![
+                KERNEL_BATCH,
+                KERNEL_SNAPSHOT,
+                KERNEL_MASK,
+                KERNEL_EFFECT,
+                KERNEL_EFFECT,
+                KERNEL_EFFECT,
+                KERNEL_EFFECT,
+                KERNEL_BLUR_H,
+                KERNEL_BLUR_V,
+            ]
+        );
     }
 }

@@ -304,3 +304,127 @@ fn frame_validation_and_display_byte_count_agree_on_boundaries() {
         Ok(max * max * 4)
     );
 }
+
+/// `DisplayList` has public fields, so callers can bypass `parse_display_list`.
+#[test]
+fn constructed_display_lists_reject_invalid_geometry_without_panicking() {
+    use opurom_gpu::{render_cpu_commands, Command, DisplayList, GpuError};
+
+    fn clean_error<T>(
+        index: usize,
+        path: &str,
+        result: std::thread::Result<Result<T, GpuError>>,
+    ) -> GpuError {
+        match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => panic!("case {index} {path} accepted an invalid list"),
+            Err(_) => panic!("case {index} {path} panicked"),
+        }
+    }
+
+    let cases: [(DisplayList, &str); 6] = [
+        (
+            DisplayList {
+                width: 2,
+                height: 1,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::Solid {
+                    rect: [1, 0, i64::MAX, 1],
+                    clip: [0, 0, 2, 1],
+                    color: [1, 2, 3, 255],
+                }],
+            },
+            "exceeds the integer range",
+        ),
+        (
+            DisplayList {
+                width: 2,
+                height: 1,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::Rounded {
+                    rect: [0, 0, 2, 1],
+                    clip: [0, 0, 2, 1],
+                    radius: i64::MAX / 2,
+                    color: [1, 2, 3, 255],
+                }],
+            },
+            "exceeds the integer range",
+        ),
+        (
+            DisplayList {
+                width: 2,
+                height: 1,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::Gradient {
+                    rect: [0, 0, 2, i64::MIN],
+                    clip: [0, 0, 2, 1],
+                    radius: 0,
+                    top: [0, 0, 0, 255],
+                    bottom: [1, 2, 3, 255],
+                    alpha: 255,
+                }],
+            },
+            "exceeds the integer range",
+        ),
+        (
+            DisplayList {
+                width: 8,
+                height: 4,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::Solid {
+                    rect: [0, 0, 2, 2],
+                    clip: [0, 0, 9, 2],
+                    color: [1, 2, 3, 255],
+                }],
+            },
+            "clip extends outside the viewport",
+        ),
+        (
+            DisplayList {
+                width: 8,
+                height: 4,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::EffectBlur { radius: 33 }],
+            },
+            "radius 33 must be 0..=32",
+        ),
+        (
+            DisplayList {
+                width: 8,
+                height: 4,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::EffectShadow {
+                    bounds: [-1, 0, 4, 4],
+                    radius: 1,
+                    dx: 0,
+                    dy: 0,
+                    alpha: 0,
+                    color: [0, 0, 0, 255],
+                }],
+            },
+            "bounds must be normalized",
+        ),
+    ];
+    for (index, (list, expected)) in cases.iter().enumerate() {
+        let packed = clean_error(
+            index,
+            "pack",
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list.pack())),
+        );
+        let rendered = clean_error(
+            index,
+            "render",
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_cpu_commands(list))),
+        );
+        for (path, error) in [("pack", packed), ("render", rendered)] {
+            assert!(
+                matches!(error, GpuError::InvalidDisplayList(_)),
+                "case {index} {path}: {error}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "case {index} {path}: {error} must mention {expected:?}"
+            );
+        }
+    }
+}
