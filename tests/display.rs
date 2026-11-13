@@ -272,6 +272,71 @@ fn metal_horizontal_gradient_matches_cpu_unit_oracle() {
     ));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_particles_match_cpu_unit_oracle_on_a_mixed_stream() {
+    let json = r#"{"version":1,"width":48,"height":32,"background":[10,20,30,255],"commands":[
+{"kind":"solid","rect":[0,0,48,32],"clip":[0,0,48,32],"color":[24,32,44,255]},
+{"kind":"particles","rect":[-2,-1,52,34],"clip":[0,0,48,32],"count":40,"seed":7,"radius":2,"color":[255,80,40,255]},
+{"kind":"gradient_horizontal","rect":[0,0,48,8],"clip":[0,0,48,32],"radius":0,"top":[16,32,48,255],"bottom":[240,192,144,255],"alpha":255},
+{"kind":"particles","rect":[8,4,24,20],"clip":[8,0,32,32],"count":16,"seed":42,"radius":1,"color":[240,240,240,128]},
+{"kind":"rounded","rect":[20,8,12,10],"clip":[0,0,48,32],"radius":2,"color":[9,200,80,255]},
+{"kind":"gradient","rect":[0,20,48,12],"clip":[0,0,48,32],"radius":0,"top":[16,32,48,255],"bottom":[240,192,144,255],"alpha":255}
+]}"#;
+    let list = opurom_gpu::parse_display_list(json).expect("fixture must parse");
+    let cpu = opurom_gpu::render_cpu_commands(&list).expect("CPU oracle must render");
+    let gpu = opurom_gpu::raster_display(&list).expect("Metal raster must succeed");
+    assert_eq!(
+        gpu.pixels, cpu,
+        "Metal readback must byte-match the CPU oracle"
+    );
+    let again = opurom_gpu::raster_display(&list).expect("Metal raster must succeed");
+    assert_eq!(again.pixels, gpu.pixels, "identical lists render alike");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn metal_particles_match_cpu_unit_oracle_on_a_mixed_stream() {
+    skip("particle raster requires macOS Metal; asserting MetalUnavailable instead");
+    let json = r#"{"version":1,"width":4,"height":1,"background":[0,0,0,255],"commands":[{"kind":"particles","rect":[0,0,4,1],"clip":[0,0,4,1],"count":2,"seed":1,"radius":1,"color":[1,2,3,255]}]}"#;
+    assert!(matches!(
+        opurom_gpu::raster_json_ppm(json),
+        Err(opurom_gpu::GpuError::MetalUnavailable(_))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_particle_ir_matches_independent_software_renderer() {
+    let Some(renderer) = sibling_renderer() else {
+        skip("sibling opurom-render binary not found (set OPUROM_RENDER_BIN); cannot run the particle IR proof");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let ir_path = dir.join("display-particles-ir.opuir.json");
+    let ir = r##"{"ir":"0.1","app":"Particles","state":[],"tree":{"id":0,"kind":"Column","props":{"padding":4},"children":[{"id":1,"kind":"Container","props":{"width":48,"height":24,"color":"#223344","particles":{"count":40,"seed":7,"radius":2,"alpha":768,"color":"#FF8040"}},"children":[],"events":{}}],"events":{}},"theme":{"mode":"dark","accent":"#097FEB","radius":4}}"##;
+    fs::write(&ir_path, ir).unwrap();
+    assert_cross_repo_byte_equality(&renderer, &ir_path, "64", "40", "particles-ir");
+    let commands = dir.join("display-particles-ir.commands.json");
+    assert!(
+        fs::read_to_string(&commands)
+            .unwrap()
+            .contains("\"kind\":\"particles\""),
+        "the display list must carry a particles command"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn metal_particle_ir_matches_independent_software_renderer() {
+    skip("cross-repo particle IR equality requires macOS Metal");
+    let json = r#"{"version":1,"width":1,"height":1,"background":[0,0,0,255],"commands":[]}"#;
+    assert!(matches!(
+        opurom_gpu::raster_json_ppm(json),
+        Err(opurom_gpu::GpuError::MetalUnavailable(_))
+    ));
+}
+
 #[test]
 fn ppm_encoding_and_byte_count_validate_inputs() {
     assert_eq!(

@@ -88,6 +88,7 @@ constant uint KIND_SOLID = 0u;
 constant uint KIND_ROUNDED = 1u;
 constant uint KIND_GRADIENT = 2u;
 constant uint KIND_GRADIENT_H = 3u;
+constant uint KIND_PARTICLES = 4u;
 
 static inline uchar4 unpack_rgba(uint packed) {
     return uchar4(
@@ -99,6 +100,17 @@ static inline uchar4 unpack_rgba(uint packed) {
 }
 
 static inline long dec(uint v) { return long(v) - COORD_BIAS; }
+
+// Integer avalanche mix: pure in (seed, dot index), so no particle positions
+// need to be uploaded and every host computes the same centres.
+static inline uint particle_mix(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15u;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16u;
+    return x;
+}
 
 static inline uchar clamp_u8(long v) {
     if (v < 0) return uchar(0);
@@ -261,6 +273,21 @@ kernel void raster_batch(
                 alpha
             );
             color = blend_px(color, src);
+        } else if (kind == KIND_PARTICLES) {
+            const uchar4 dot = unpack_rgba(cmds[base + 10u]);
+            const uint pcount = cmds[base + 11u];
+            const uint pseed = cmds[base + 12u];
+            const long prad = long(cmds[base + 13u]);
+            const long limit = prad * prad;
+            for (uint i = 0u; i < pcount; ++i) {
+                const uint hx = particle_mix(pseed ^ (i * 0x9E3779B9u + 0x6C078965u));
+                const uint hy = particle_mix(pseed ^ (i * 0x9E3779B9u + 0x85EBCA6Bu));
+                const long cx = rx + long(hx % uint(rw));
+                const long cy = ry + long(hy % uint(rh));
+                const long dx = px - cx;
+                const long dy = py - cy;
+                if (dx * dx + dy * dy <= limit) color = blend_px(color, dot);
+            }
         } else if (kind == KIND_SOLID || kind == KIND_ROUNDED) {
             color = blend_px(color, unpack_rgba(cmds[base + 10u]));
         }

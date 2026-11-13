@@ -19,6 +19,11 @@ pub const EFFECT_MAX_RADIUS: i64 = 32;
 pub const EFFECT_MAX_OFFSET: i64 = 64;
 pub const EFFECT_UNIT: i64 = 1024;
 
+/// Particle parameter bounds, shared with opurom-render's particle schema.
+pub const PARTICLE_MAX_COUNT: i64 = 512;
+pub const PARTICLE_MAX_RADIUS: i64 = 32;
+pub const PARTICLE_MAX_SEED: i64 = u32::MAX as i64;
+
 /// Fixed-size parameter block passed to every Metal compute pass.
 pub const PARAM_WORDS: usize = 28;
 pub const KERNEL_BATCH: u32 = 0;
@@ -39,6 +44,7 @@ const SOLID: u32 = 0;
 const ROUNDED: u32 = 1;
 const GRADIENT: u32 = 2;
 const GRADIENT_HORIZONTAL: u32 = 3;
+const PARTICLES: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -68,6 +74,16 @@ pub enum Command {
         top: [u8; 4],
         bottom: [u8; 4],
         alpha: u8,
+    },
+    /// Deterministic particle field: `count` integer dots scattered over the
+    /// rect by a seeded pure integer hash, blended in dot order.
+    Particles {
+        rect: [i64; 4],
+        clip: [i64; 4],
+        count: i64,
+        seed: i64,
+        radius: i64,
+        color: [u8; 4],
     },
     /// Snapshot the frame before a node's ordinary draw commands.
     EffectBackdrop,
@@ -137,11 +153,17 @@ impl Command {
             | Command::GradientHorizontal {
                 rect, clip, radius, ..
             } => (rect, clip, radius),
+            Command::Particles { rect, clip, .. } => (rect, clip, 0),
             _ => return None,
         })
     }
 
     fn sample(&self, x: i64, y: i64) -> Option<[u8; 4]> {
+        // Particles blend dot by dot in `blend_at`; `sample` covers the four
+        // single-source rect kinds.
+        if matches!(self, Command::Particles { .. }) {
+            return None;
+        }
         let (rect, clip, radius) = self.geometry()?;
         if x < rect[0] || y < rect[1] || x >= rect[0] + rect[2] || y >= rect[1] + rect[3] {
             return None;
@@ -189,6 +211,42 @@ impl Command {
         }
     }
 
+    /// Blend one command into `pixel`. Regular commands sample a single source
+    /// colour; particles blend every covering dot in index order, which is the
+    /// same order the MSL kernel uses.
+    fn blend_at(&self, pixel: &mut [u8], x: i64, y: i64) {
+        if let Command::Particles {
+            rect,
+            clip,
+            count,
+            seed,
+            radius,
+            color,
+        } = self
+        {
+            if x < rect[0] || y < rect[1] || x >= rect[0] + rect[2] || y >= rect[1] + rect[3] {
+                return;
+            }
+            if x < clip[0] || y < clip[1] || x >= clip[0] + clip[2] || y >= clip[1] + clip[3] {
+                return;
+            }
+            let rad = (*radius).max(0);
+            let limit = rad * rad;
+            for index in 0..*count {
+                let (cx, cy) = particle_center(*rect, *seed, index as u32);
+                let dx = x - cx;
+                let dy = y - cy;
+                if dx * dx + dy * dy <= limit {
+                    blend(pixel, *color);
+                }
+            }
+            return;
+        }
+        if let Some(src) = self.sample(x, y) {
+            blend(pixel, src);
+        }
+    }
+
     fn pack_regular(&self) -> Result<[u32; COMMAND_WORDS], GpuError> {
         let (rect, clip, radius) = self.geometry().expect("regular command");
         let mut packed = [0u32; COMMAND_WORDS];
@@ -197,6 +255,7 @@ impl Command {
             Command::Rounded { .. } => ROUNDED,
             Command::Gradient { .. } => GRADIENT,
             Command::GradientHorizontal { .. } => GRADIENT_HORIZONTAL,
+            Command::Particles { .. } => PARTICLES,
             _ => unreachable!("regular command"),
         };
         for (offset, value) in rect.iter().enumerate() {
@@ -219,6 +278,20 @@ impl Command {
                 packed[10] = pack_rgba(top);
                 packed[11] = pack_rgba(bottom);
                 packed[12] = u32::from(alpha);
+            }
+            Command::Particles {
+                color,
+                count,
+                seed,
+                radius,
+                ..
+            } => {
+                packed[10] = pack_rgba(color);
+                // Words 11..=13 are raw integers, not biased coordinates; the
+                // MSL kernel reads them directly.
+                packed[11] = count as u32;
+                packed[12] = seed as u32;
+                packed[13] = radius as u32;
             }
             _ => unreachable!("regular command"),
         }
@@ -354,6 +427,15 @@ impl DisplayList {
                 validate_gradient_stops(command)?;
             } else {
                 validate_effect(command, self.width, self.height)?;
+            }
+            if let Command::Particles {
+                count,
+                seed,
+                radius,
+                ..
+            } = command
+            {
+                validate_particles(*count, *seed, *radius)?;
             }
         }
         Ok(())
@@ -496,9 +578,7 @@ pub fn render_cpu_commands(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
         for x in 0..list.width {
             let offset = (y as usize * list.width as usize + x as usize) * 4;
             for command in &list.commands {
-                if let Some(src) = command.sample(i64::from(x), i64::from(y)) {
-                    blend(&mut pixels[offset..offset + 4], src);
-                }
+                command.blend_at(&mut pixels[offset..offset + 4], i64::from(x), i64::from(y));
             }
         }
     }
@@ -717,6 +797,37 @@ fn effect_range(value: i64, lo: i64, hi: i64, what: &str) -> Result<(), GpuError
         return Err(bad_effect(format!("{what} {value} must be {lo}..={hi}")));
     }
     Ok(())
+}
+
+/// Particle bounds are rechecked on every path so directly-constructed lists
+/// cannot make the CPU oracle or the MSL kernel loop beyond the bounded count.
+fn validate_particles(count: i64, seed: i64, radius: i64) -> Result<(), GpuError> {
+    effect_range(count, 0, PARTICLE_MAX_COUNT, "count")?;
+    effect_range(seed, 0, PARTICLE_MAX_SEED, "seed")?;
+    effect_range(radius, 0, PARTICLE_MAX_RADIUS, "radius")?;
+    Ok(())
+}
+
+/// Centre of dot `index`: two independent integer hashes of `(seed, index)`
+/// reduced with modulo into the rect. The MSL kernel evaluates the identical
+/// `u32` expression, so no particle positions need to be uploaded.
+fn particle_center(rect: [i64; 4], seed: i64, index: u32) -> (i64, i64) {
+    let mix = |mut x: u32| -> u32 {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+        x
+    };
+    let s = seed as u32;
+    // The two constants decorrelate the axes; wrapping matches MSL `uint`.
+    let hx = mix(s ^ index.wrapping_mul(0x9e37_79b9).wrapping_add(0x6c07_8965));
+    let hy = mix(s ^ index.wrapping_mul(0x9e37_79b9).wrapping_add(0x85eb_ca6b));
+    (
+        rect[0] + i64::from(hx % rect[2] as u32),
+        rect[1] + i64::from(hy % rect[3] as u32),
+    )
 }
 
 fn effect_coords(values: [i64; 4], what: &str) -> Result<(), GpuError> {
@@ -1060,10 +1171,42 @@ fn parse_regular_command(
                 }
             }
         }
+        "particles" => {
+            parser.expect(b',', "after clip")?;
+            parser.key("count")?;
+            let count = parser.integer()?;
+            parser.expect(b',', "after count")?;
+            parser.key("seed")?;
+            let seed = parser.integer()?;
+            parser.expect(b',', "after seed")?;
+            parser.key("radius")?;
+            let radius = parser.integer()?;
+            parser.expect(b',', "after radius")?;
+            parser.key("color")?;
+            let color = parser.u8_array("color")?;
+            parser.expect(b'}', "after particles command")?;
+            Command::Particles {
+                rect,
+                clip,
+                count,
+                seed,
+                radius,
+                color,
+            }
+        }
         other => return Err(parser.error(format!("unsupported command kind {other:?}"))),
     };
     let (_, _, radius) = command.geometry().expect("regular command");
     validate_geometry(rect, clip, radius, width, height)?;
+    if let Command::Particles {
+        count,
+        seed,
+        radius,
+        ..
+    } = &command
+    {
+        validate_particles(*count, *seed, *radius)?;
+    }
     Ok(command)
 }
 
@@ -1351,6 +1494,152 @@ mod tests {
         assert_eq!(
             render_cpu_commands(&constructed).unwrap(),
             render_cpu_commands(&parsed).unwrap()
+        );
+    }
+
+    const PARTICLE_STREAM: &str = "{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":6,\"seed\":7,\"radius\":1,\"color\":[200,100,50,255]}";
+
+    #[test]
+    fn particles_parse_and_pack_as_a_regular_command() {
+        let json = header(8, 4, [0, 0, 0, 255], PARTICLE_STREAM);
+        let first = parse_display_list(&json).unwrap();
+        let second = parse_display_list(&json).unwrap();
+        assert_eq!(first, second);
+        match first.commands[0] {
+            Command::Particles {
+                rect,
+                clip,
+                count,
+                seed,
+                radius,
+                color,
+            } => {
+                assert_eq!(rect, [0, 0, 8, 4]);
+                assert_eq!(clip, [0, 0, 8, 4]);
+                assert_eq!((count, seed, radius), (6, 7, 1));
+                assert_eq!(color, [200, 100, 50, 255]);
+            }
+            _ => panic!("particles command must parse"),
+        }
+        let words = first.pack().unwrap();
+        assert_eq!(words.len(), COMMAND_WORDS);
+        assert_eq!(words[0], PARTICLES);
+        assert_eq!(words[9], COORD_BIAS as u32, "no rounded-rect corners");
+        assert_eq!(words[10], pack_rgba([200, 100, 50, 255]));
+        assert_eq!(words[11], 6);
+        assert_eq!(words[12], 7);
+        assert_eq!(words[13], 1);
+        assert_eq!(
+            render_cpu_commands(&first).unwrap(),
+            render_cpu_commands(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn particle_pixels_are_seed_sensitive_and_count_zero_is_inert() {
+        let command = |count: i64, seed: i64, alpha: u8| {
+            format!(
+                "{{\"kind\":\"particles\",\"rect\":[0,0,16,8],\"clip\":[0,0,16,8],\"count\":{count},\"seed\":{seed},\"radius\":2,\"color\":[240,120,60,{alpha}]}}"
+            )
+        };
+        let pixels = |c: &str| {
+            render_cpu_commands(&parse_display_list(&header(16, 8, [10, 20, 30, 255], c)).unwrap())
+                .unwrap()
+        };
+        let a = pixels(&command(16, 1, 255));
+        let b = pixels(&command(16, 2, 255));
+        assert_eq!(a.len(), b.len());
+        assert_ne!(a, b, "the seed must select the dot positions");
+        let mut background = Vec::new();
+        for _ in 0..16 * 8 {
+            background.extend_from_slice(&[10, 20, 30, 255]);
+        }
+        assert_eq!(pixels(&command(0, 1, 255)), background);
+        assert_eq!(pixels(&command(16, 1, 0)), background, "alpha 0 is inert");
+    }
+
+    #[test]
+    fn particles_clip_to_rect_and_blend_with_fractional_alpha() {
+        let command = "{\"kind\":\"particles\",\"rect\":[1,0,6,4],\"clip\":[2,0,2,4],\"count\":1,\"seed\":9,\"radius\":32,\"color\":[200,100,50,128]}";
+        let list = parse_display_list(&header(8, 4, [10, 20, 30, 255], command)).unwrap();
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            for x in 0..8 {
+                let mut px = [10u8, 20, 30, 255];
+                if (2..4).contains(&x) {
+                    blend(&mut px, [200, 100, 50, 128]);
+                }
+                expected.extend_from_slice(&px);
+            }
+        }
+        assert_eq!(render_cpu_commands(&list).unwrap(), expected);
+    }
+
+    #[test]
+    fn particle_bounds_and_malformed_commands_are_rejected() {
+        let invalid: &[(&str, &str)] = &[
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":513,\"seed\":1,\"radius\":2,\"color\":[1,2,3,255]}", "count 513 must be 0..=512"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":-1,\"seed\":1,\"radius\":2,\"color\":[1,2,3,255]}", "count -1 must be 0..=512"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":2,\"seed\":-1,\"radius\":2,\"color\":[1,2,3,255]}", "seed -1 must be 0..=4294967295"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":2,\"seed\":4294967296,\"radius\":2,\"color\":[1,2,3,255]}", "seed 4294967296 must be 0..=4294967295"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":2,\"seed\":1,\"radius\":33,\"color\":[1,2,3,255]}", "radius 33 must be 0..=32"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":2,\"seed\":1,\"radius\":-1,\"color\":[1,2,3,255]}", "radius -1 must be 0..=32"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,0,4],\"clip\":[0,0,8,4],\"count\":2,\"seed\":1,\"radius\":2,\"color\":[1,2,3,255]}", "positive width and height"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,9,4],\"count\":2,\"seed\":1,\"radius\":2,\"color\":[1,2,3,255]}", "clip extends outside the viewport"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":\"many\",\"seed\":1,\"radius\":2,\"color\":[1,2,3,255]}", "expected an integer"),
+            ("{\"kind\":\"particles\",\"rect\":[0,0,8,4],\"clip\":[0,0,8,4],\"count\":2}", "expected ',' after count"),
+        ];
+        for (index, (command, expected)) in invalid.iter().enumerate() {
+            let error = parse_display_list(&header(8, 4, [0, 0, 0, 255], command))
+                .expect_err(&format!("invalid case {index} was accepted"));
+            assert!(
+                matches!(error, GpuError::InvalidDisplayList(_)),
+                "invalid case {index} returned {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "invalid case {index}: {error} must mention {expected:?}"
+            );
+        }
+        // Directly-constructed lists recheck the same bounds.
+        let direct = DisplayList {
+            width: 8,
+            height: 4,
+            background: [0, 0, 0, 255],
+            commands: vec![Command::Particles {
+                rect: [0, 0, 8, 4],
+                clip: [0, 0, 8, 4],
+                count: 513,
+                seed: 1,
+                radius: 2,
+                color: [1, 2, 3, 255],
+            }],
+        };
+        assert!(render_cpu_commands(&direct)
+            .unwrap_err()
+            .to_string()
+            .contains("count 513 must be 0..=512"));
+    }
+
+    #[test]
+    fn particles_share_the_regular_batch_with_other_commands() {
+        let stream =
+            format!("{PARTICLE_STREAM},{{\"kind\":\"effect_backdrop\"}},{PARTICLE_STREAM}");
+        let list = parse_display_list(&header(8, 4, [0, 0, 0, 255], &stream)).unwrap();
+        let (words, passes) = list.build_passes().unwrap();
+        assert_eq!(words.len(), 2 * COMMAND_WORDS);
+        let kernels: Vec<u32> = passes.iter().map(|p| p.kernel).collect();
+        assert_eq!(
+            kernels,
+            vec![KERNEL_BATCH, KERNEL_BATCH, KERNEL_SNAPSHOT, KERNEL_BATCH]
+        );
+        assert_eq!(passes[1].params[6], 1);
+        assert_eq!(passes[3].params[5], COMMAND_WORDS as u32);
+        assert_eq!(passes[3].params[6], 1);
+        let again = parse_display_list(&header(8, 4, [0, 0, 0, 255], &stream)).unwrap();
+        assert_eq!(
+            render_cpu_commands(&list).unwrap(),
+            render_cpu_commands(&again).unwrap()
         );
     }
 

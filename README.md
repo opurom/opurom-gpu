@@ -41,6 +41,11 @@ Implemented now:
 - `gradient_horizontal`: a regular display-list command for a two-stop integer
   gradient across columns, evaluated by both the CPU oracle and the
   `raster_batch` MSL kernel with the same clipping, rounding and blend order.
+- `particles`: a regular display-list command for a deterministic particle
+  field. `count` integer dots are placed inside the rect by a seeded integer
+  xorshift/multiply hash; the CPU oracle and the `raster_batch` MSL kernel
+  evaluate the same dot centres, circle coverage and `/255` blend, so a mixed
+  stream has a byte-identical Metal readback.
 - No font bitmap lives in this crate: `opurom-render` rasterizes anti-aliased
   glyph coverage into 1x1 solid commands with fractional alpha, and Metal
   blends them with the same integer `/255` contract as the software raster.
@@ -66,9 +71,9 @@ same integer order and packing, so the readback must byte-match.
 ## Display-list raster proof
 
 `opurom-render --commands <out.json>` dumps the exact frame display list:
-viewport, opaque background, and every solid rect, rounded rect and two-stop
-vertical gradient in draw order with integer bounds and colours (bitmap glyph
-runs are decomposed CPU-side into solid rect commands). `raster` executes that
+viewport, opaque background, and every solid rect, rounded rect, two-stop
+vertical gradient and particle field in draw order with integer bounds and
+colours (bitmap glyph runs are decomposed CPU-side into solid rect commands). `raster` executes that
 stream on Metal: signed coordinates are encoded as `value + 2^30` for MSL's
 `int`, corners use the renderer's integer quarter-circle test, and alpha
 blending uses the renderer's `/255` integer blend, all evaluated per pixel in
@@ -89,6 +94,35 @@ negative rect origins, fractional-alpha blending, packing, pass order and
 malformed inputs; a macOS test compares the Metal readback against the CPU
 oracle for a stream containing both gradient orientations, a rounded rect and
 negative coordinates.
+
+A second regular command kind, `particles`, draws a fixed-count scatter of
+integer dots inside the rect. Its bounded integer fields are `count` (`0..=512`),
+`seed` (`0..=4294967295`), `radius` (`0..=32`) and `color` (RGBA8; the alpha
+byte is the blend alpha). Dot `i` is centred at
+
+```text
+cx = rect.x + mix(seed ^ (i * A + B)) mod rect.w
+cy = rect.y + mix(seed ^ (i * A + C)) mod rect.h
+```
+
+where `A`, `B` and `C` are fixed 32-bit constants and `mix` is an integer
+xorshift/multiply avalanche over `u32`. A pixel is covered when
+`dx*dx + dy*dy <= radius*radius`; covered dots blend in index order with the
+same `/255` integer blend as the other regular commands, clipped to the rect
+and the command clip. Particles are a spatial primitive: no time input, motion,
+physics or wall clock is involved, and the seed is the only input that selects
+positions. `count=0` and a zero colour alpha paint nothing. The parser rejects
+out-of-range counts, seeds and radii, malformed fields and an invalid
+geometry; `DisplayList::validate` rechecks those bounds for directly
+constructed lists. Packing uses `KIND_PARTICLES = 4`, word 10 for the packed
+colour and words 11, 12 and 13 for the raw count, seed and radius. Unit tests
+cover parsing, packing, pass order, clipping, fractional alpha, seed
+sensitivity, `count=0` and malformed bounds; a macOS test compares the Metal
+readback against the CPU oracle for a mixed stream of solids, rounded rects,
+both gradient orientations and two particle fields with negative coordinates
+and fractional alpha. A second macOS test renders particle IR with
+`opurom-render --commands`, executes that display list on Metal and compares
+both PPMs byte-for-byte.
 
 The cross-repo test in `tests/display.rs` locates the sibling renderer binary
 `../opurom-render/target/debug/opurom-render` (override with
@@ -283,14 +317,16 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **42 tests**
-(31 unit tests and eleven integration tests), including the two cross-repo `cmp`
-proofs in `tests/display.rs` and `tests/effects.rs`; GPU execution cannot be
+that no fake success occurs. On macOS, `cargo test --offline` runs **51 tests**
+(38 unit tests and thirteen integration tests), including the cross-repo `cmp`
+proofs in `tests/display.rs` and `tests/effects.rs` and the Metal/CPU equality
+proof for a mixed stream containing particles; GPU execution cannot be
 validated by Linux CI.
 
 ## Backend scope
 
-This backend is display-list work over rects plus five framebuffer effect kernels, with
+This backend is display-list work over rects, deterministic particle fields and
+five framebuffer effect kernels, with
 one real Metal drawable presentation path for one live AppKit window. Glyph
 shapes reach the GPU as CPU-decomposed rectangles, and the system default Metal device is the
 one queried. The dispatch path, the readback equality proof and the on-screen presentation
