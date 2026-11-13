@@ -24,7 +24,8 @@ mod reference;
 pub use display::{
     parse_display_list, render_cpu_commands, Command, DisplayList, Pass, COMMAND_WORDS, COORD_BIAS,
     KERNEL_BATCH, KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_MASK, KERNEL_SNAPSHOT,
-    MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS,
+    MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS, PARTICLE_MAX_COUNT, PARTICLE_MAX_RADIUS,
+    PARTICLE_MAX_SEED,
 };
 pub use reference::{render_cpu, Rgb};
 
