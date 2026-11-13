@@ -184,6 +184,28 @@ bar) with **0 mismatching pixels of 30 000**, max channel delta 25 and
 window and one frame, macOS/Metal only. There is no Vulkan/ANGLE/D3D backend,
 no GPU text shaping, no measured fps claim and no device conformance matrix.
 
+## Animated multi-frame presentation
+
+`opr_present_display_list_timed(json, layer, reason, capacity, timings)` is the
+per-frame C entry point for the bounded animation loop. It has the same status
+vocabulary as `opr_present_display_list` and additionally writes a `repr(C)`
+`FrameTimings { dispatch_ns, present_ns }` measured with `std::time::Instant`:
+`dispatch_ns` covers the Metal compute raster of that frame, `present_ns` covers
+drawable acquisition, the blit, `presentDrawable`, commit, completion and the
+layer contents refresh. Timings are zero unless the frame really presented.
+
+On every loop frame the layer contents is **rebound to the IOSurface of the
+drawable that was just presented**: `setContents(None)` in a committed
+`CATransaction`, a flush, then `setContents(Some(surface))` in another committed
+transaction and a flush. `CAMetalLayer` recycles a small IOSurface pool, so
+reassigning the same object without clearing it is a no-op for Core Animation
+and `cacheDisplay(in:to:)` would keep showing the first frame. The single-frame
+entry point keeps its original binding unchanged.
+
+The loop driver and capture live in `opurom-platform` under
+`--verify-gpu-animation-loop`; both are described there. This crate performs no
+window capture and makes no fps or smoothness claim.
+
 ## Commands
 
 ```sh
@@ -240,8 +262,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **31 tests**
-(27 display-list and effect tests plus four presentation tests), including the
+that no fake success occurs. On macOS, `cargo test --offline` runs **33 tests**
+(26 display-list and effect tests plus seven presentation tests), including the
 two cross-repo `cmp`
 proofs in `tests/display.rs` and `tests/effects.rs`; GPU execution cannot be
 validated by Linux CI.

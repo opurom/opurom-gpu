@@ -8,6 +8,8 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use crate::{display_byte_count, GpuError};
 
@@ -23,9 +25,27 @@ use objc2_metal::{
     MTLDrawable, MTLOrigin, MTLPixelFormat, MTLSize, MTLTexture,
 };
 #[cfg(target_os = "macos")]
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer, CATransaction};
 #[cfg(any(target_os = "macos", test))]
 use std::ffi::CStr;
+
+/// Wall-clock timings of one presented frame, measured with `std::time::Instant`.
+///
+/// `dispatch_ns` is the Metal compute dispatch for that frame (all raster
+/// passes, from commit through completion). `present_ns` covers drawable
+/// acquisition, the blit, `presentDrawable`, commit, completion and the layer
+/// contents refresh. Nanoseconds keep the C ABI free of floating point.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameTimings {
+    pub dispatch_ns: u64,
+    pub present_ns: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn nanos(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
 
 pub const PRESENT_OK: c_int = 0;
 pub const PRESENT_METAL_UNAVAILABLE: c_int = 10;
@@ -114,6 +134,36 @@ pub extern "C" fn opr_present_display_list(
     reason: *mut c_char,
     reason_capacity: usize,
 ) -> c_int {
+    present_entry(json, layer, reason, reason_capacity, ptr::null_mut())
+}
+
+/// Per-frame entry point for the bounded animation loop: identical to
+/// `opr_present_display_list`, plus the `Instant`-measured dispatch and present
+/// times of this frame written to `timings`.
+#[no_mangle]
+pub extern "C" fn opr_present_display_list_timed(
+    json: *const c_char,
+    layer: *mut c_void,
+    reason: *mut c_char,
+    reason_capacity: usize,
+    timings: *mut FrameTimings,
+) -> c_int {
+    present_entry(json, layer, reason, reason_capacity, timings)
+}
+
+fn present_entry(
+    json: *const c_char,
+    layer: *mut c_void,
+    reason: *mut c_char,
+    reason_capacity: usize,
+    timings: *mut FrameTimings,
+) -> c_int {
+    if !timings.is_null() {
+        // SAFETY: the caller owns a writable FrameTimings for this call.
+        unsafe {
+            *timings = FrameTimings::default();
+        }
+    }
     let result = catch_unwind(AssertUnwindSafe(|| {
         if json.is_null() {
             write_reason(reason, reason_capacity, "the display list pointer is null");
@@ -133,9 +183,15 @@ pub extern "C" fn opr_present_display_list(
                     return PRESENT_INVALID_ARGUMENT;
                 }
             };
-            match present_impl(text, layer) {
-                Ok(()) => {
+            match present_impl(text, layer, !timings.is_null()) {
+                Ok(measured) => {
                     write_reason(reason, reason_capacity, "");
+                    if !timings.is_null() {
+                        // SAFETY: the caller owns a writable FrameTimings.
+                        unsafe {
+                            *timings = measured;
+                        }
+                    }
                     PRESENT_OK
                 }
                 Err(error) => {
@@ -163,13 +219,42 @@ pub extern "C" fn opr_present_display_list(
     })
 }
 
+/// Rebind the layer contents to the surface of the drawable that was JUST
+/// presented. CAMetalLayer recycles a small pool of IOSurfaces: assigning the
+/// same object again is a no-op for Core Animation, so `cacheDisplay` would
+/// keep showing frame 0 forever. Clearing in a committed transaction first
+/// forces every frame to re-read the freshly blitted surface.
 #[cfg(target_os = "macos")]
-fn present_impl(json: &str, layer: *mut c_void) -> Result<(), GpuError> {
+fn refresh_layer_contents(layer: &CAMetalLayer, surface: &AnyObject) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    // SAFETY: `surface` outlives the retained layer contents; CALayer accepts
+    // its IOSurface-backed contents object.
+    unsafe { layer.setContents(None) };
+    CATransaction::commit();
+    CATransaction::flush();
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    unsafe { layer.setContents(Some(surface)) };
+    CATransaction::commit();
+    CATransaction::flush();
+}
+
+#[cfg(target_os = "macos")]
+fn present_impl(
+    json: &str,
+    layer: *mut c_void,
+    refresh_contents: bool,
+) -> Result<FrameTimings, GpuError> {
     let list = parse_display_list(json)?;
     let byte_count = display_byte_count(list.width, list.height)?;
     let (packed, passes) = list.build_passes()?;
+    // Both phases of each loop frame are timed with std::time::Instant.
+    let dispatch_started = Instant::now();
     let raster = metal::raster_buffer(&packed, &passes, byte_count)?;
+    let dispatch_ns = nanos(dispatch_started.elapsed());
     let copy = blit_copy(list.width, list.height)?;
+    let present_started = Instant::now();
 
     // SAFETY: the caller retains the live CAMetalLayer for this call; both
     // crates use the same Objective-C object representation.
@@ -221,11 +306,11 @@ fn present_impl(json: &str, layer: *mut c_void) -> Result<(), GpuError> {
     };
     encode_presentation(&mut encoder, copy)?;
 
-    // The presented drawable's own IOSurface is exposed as the layer contents:
-    // `cacheDisplay(in:to:)` re-renders the layer tree offscreen and
-    // cannot see window-server drawable content (it renders blank). This is
-    // the exact zero-copy surface the Metal blit wrote and the window server
-    // presents, never a CPU re-render or a second drawable substitute.
+    // `cacheDisplay(in:to:)` re-renders the layer tree offscreen and cannot
+    // see window-server drawable content (it renders blank), so the presented
+    // drawable's own IOSurface is exposed as layer contents. Refresh it on
+    // EVERY frame from the drawable that was just presented: this is the exact
+    // zero-copy surface the Metal blit wrote, never a CPU re-render.
     let Some(surface) = texture.iosurface() else {
         return Err(GpuError::DrawableUnavailable(
             "the drawable texture is not IOSurface-backed; cacheDisplay cannot capture the presented frame"
@@ -233,10 +318,21 @@ fn present_impl(json: &str, layer: *mut c_void) -> Result<(), GpuError> {
         ));
     };
     let contents: &AnyObject = (*surface).as_ref();
-    // SAFETY: the surface outlives the retained layer contents, and CALayer
-    // accepts its IOSurface-backed contents object.
-    unsafe { layer.setContents(Some(contents)) };
-    Ok(())
+    if refresh_contents {
+        // Bounded loop: every frame rebinds the layer to the surface of the
+        // drawable that was JUST presented, so no frame shows a stale one.
+        refresh_layer_contents(layer, contents);
+    } else {
+        // Single-frame presentation keeps its original, unchanged binding.
+        // SAFETY: the surface outlives the retained layer contents, and CALayer
+        // accepts its IOSurface-backed contents object.
+        unsafe { layer.setContents(Some(contents)) };
+    }
+    let present_ns = nanos(present_started.elapsed());
+    Ok(FrameTimings {
+        dispatch_ns,
+        present_ns,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -385,5 +481,63 @@ mod tests {
         assert_eq!(status, PRESENT_INVALID_ARGUMENT);
         let reason = unsafe { CStr::from_ptr(reason.as_ptr()) }.to_str().unwrap();
         assert!(reason.contains("display list pointer"));
+    }
+
+    #[test]
+    fn timed_frame_defaults_to_zero_measurements() {
+        assert_eq!(
+            FrameTimings::default(),
+            FrameTimings {
+                dispatch_ns: 0,
+                present_ns: 0,
+            }
+        );
+        assert_eq!(
+            std::mem::size_of::<FrameTimings>(),
+            2 * std::mem::size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn timed_frame_rejects_a_null_layer_without_a_pass_or_timings() {
+        let json =
+            c"{\"version\":1,\"width\":1,\"height\":1,\"background\":[0,0,0,255],\"commands\":[]}";
+        let mut reason = [0 as c_char; 256];
+        let mut timings = FrameTimings {
+            dispatch_ns: 999,
+            present_ns: 999,
+        };
+        let status = opr_present_display_list_timed(
+            json.as_ptr(),
+            ptr::null_mut(),
+            reason.as_mut_ptr(),
+            reason.len(),
+            &mut timings,
+        );
+        assert_eq!(status, PRESENT_INVALID_ARGUMENT);
+        assert_eq!(timings, FrameTimings::default());
+        let reason = unsafe { CStr::from_ptr(reason.as_ptr()) }.to_str().unwrap();
+        assert!(reason.contains("CAMetalLayer pointer is null"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn timed_frame_is_an_honest_skip_off_macos() {
+        let json =
+            c"{\"version\":1,\"width\":1,\"height\":1,\"background\":[0,0,0,255],\"commands\":[]}";
+        let mut reason = [0 as c_char; 256];
+        let mut timings = FrameTimings::default();
+        let status = opr_present_display_list_timed(
+            json.as_ptr(),
+            1 as *mut c_void,
+            reason.as_mut_ptr(),
+            reason.len(),
+            &mut timings,
+        );
+        assert_eq!(status, PRESENT_UNSUPPORTED);
+        assert_eq!(timings, FrameTimings::default());
+        let reason = unsafe { CStr::from_ptr(reason.as_ptr()) }.to_str().unwrap();
+        assert!(reason.contains("macOS"));
+        assert!(!reason.contains("PASS"));
     }
 }
