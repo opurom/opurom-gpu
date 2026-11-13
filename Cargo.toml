@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "=0.6.5", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
@@ -21,6 +24,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
 objc2-metal = { version = "=0.3.2", default-features = false, features = [
     "std",
     "MTLAllocation",
+    "MTLBlitCommandEncoder",
     "MTLBuffer",
     "MTLCommandBuffer",
     "MTLCommandEncoder",
@@ -29,8 +33,21 @@ objc2-metal = { version = "=0.3.2", default-features = false, features = [
     "MTLComputePipeline",
     "MTLDefines",
     "MTLDevice",
+    "MTLDrawable",
     "MTLLibrary",
     "MTLPipeline",
+    "MTLPixelFormat",
     "MTLResource",
+    "MTLTexture",
     "MTLTypes",
+    "objc2-io-surface",
+] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std"] }
+objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "CALayer",
+    "CAMetalLayer",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-metal",
 ] }
