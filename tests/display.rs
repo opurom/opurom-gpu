@@ -554,3 +554,84 @@ fn constructed_display_lists_reject_invalid_geometry_without_panicking() {
         }
     }
 }
+
+/// `DisplayList` fields are public, so a directly-built particle field has to
+/// hit the same `validate()` geometry bounds as every other regular command:
+/// the packing path must fail before it emits a single word, and the CPU oracle
+/// must fail before it touches a pixel.
+#[test]
+fn constructed_particle_fields_share_regular_geometry_validation() {
+    use opurom_gpu::{
+        render_cpu_commands, Command, DisplayList, GpuError, COMMAND_WORDS, COORD_BIAS,
+    };
+
+    let field = |rect: [i64; 4], clip: [i64; 4], count: i64, seed: i64, radius: i64| DisplayList {
+        width: 8,
+        height: 4,
+        background: [0, 0, 0, 255],
+        commands: vec![Command::Particles {
+            rect,
+            clip,
+            count,
+            seed,
+            radius,
+            color: [1, 2, 3, 255],
+        }],
+    };
+
+    let cases: [(DisplayList, &str); 6] = [
+        (
+            field([0, 0, 0, 4], [0, 0, 8, 4], 4, 1, 2),
+            "positive width and height",
+        ),
+        (
+            field([i64::MAX, 0, 8, 4], [0, 0, 8, 4], 4, 1, 2),
+            "exceeds the integer range",
+        ),
+        (
+            field([0, 0, 8, 4], [0, 0, 9, 4], 4, 1, 2),
+            "clip extends outside the viewport",
+        ),
+        (
+            field([0, 0, 8, 4], [0, 0, 8, 4], 513, 1, 2),
+            "count 513 must be 0..=512",
+        ),
+        (
+            field([0, 0, 8, 4], [0, 0, 8, 4], 4, -1, 2),
+            "seed -1 must be 0..=4294967295",
+        ),
+        (
+            field([0, 0, 8, 4], [0, 0, 8, 4], 4, 1, 33),
+            "radius 33 must be 0..=32",
+        ),
+    ];
+    for (index, (list, expected)) in cases.iter().enumerate() {
+        let outcomes = [
+            ("pack", list.pack().map(|_| ())),
+            ("render", render_cpu_commands(list).map(|_| ())),
+        ];
+        for (path, outcome) in outcomes {
+            let error = outcome.expect_err(&format!("case {index} {path} accepted the field"));
+            assert!(
+                matches!(error, GpuError::InvalidDisplayList(_)),
+                "case {index} {path}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "case {index} {path}: {error} must mention {expected:?}"
+            );
+        }
+    }
+
+    // A negative origin is ordinary geometry for a regular command: the field
+    // packs to the biased signed words and the oracle renders it without panic.
+    let shifted = field([-8, -4, 16, 12], [0, 0, 8, 4], 4, 7, 2);
+    let words = shifted.pack().expect("a negative origin is legal geometry");
+    assert_eq!(words.len(), COMMAND_WORDS);
+    assert_eq!(words[1], (-8 + COORD_BIAS) as u32);
+    assert_eq!(words[2], (-4 + COORD_BIAS) as u32);
+    assert_eq!(words[5], COORD_BIAS as u32);
+    let pixels = render_cpu_commands(&shifted).expect("a negative origin is legal geometry");
+    assert_eq!(pixels.len(), 8 * 4 * 4);
+    assert_eq!(pixels, render_cpu_commands(&shifted).unwrap());
+}
