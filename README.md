@@ -38,6 +38,9 @@ Implemented now:
   dispatches one Metal thread per viewport pixel over `raster_batch`, reads the
   result back, and writes the renderer's exact P6 PPM format
   (`P6\n<w> <h>\n255\n` + RGB triplets).
+- No font bitmap lives in this crate: `opurom-render` rasterizes anti-aliased
+  glyph coverage into 1x1 solid commands with fractional alpha, and Metal
+  blends them with the same integer `/255` contract as the software raster.
 - Effect commands: `snapshot_frame`, `build_mask`, `effect_local` and the
   two `blur_*` kernels run as separate committed compute passes over two
   ping-pong RGBA frame buffers, one backdrop snapshot and one silhouette-mask
@@ -83,7 +86,7 @@ cmp cpu.ppm gpu.ppm   # exit 0
 ../opurom-render/target/debug/opurom-render \
   ../opurom-spec/counter.opuir.json 320 240 cpu.ppm --commands counter.commands.json
 ./target/debug/opurom-gpu raster counter.commands.json gpu.ppm
-cmp cpu.ppm gpu.ppm   # exit 0, PPM digest 56dace091d467614
+cmp cpu.ppm gpu.ppm   # exit 0, PPM digest 2d4f92cb70b30ab4
 ```
 
 That comparison is a real GPU/software proof between two independent
@@ -129,14 +132,14 @@ The committed effect fixture is
 ```sh
 ../opurom-render/target/debug/opurom-render \
   ../opurom-render/tests/fixtures/r9_effect.opuir.json 96 64 cpu.ppm \
-  --commands fx.commands.json      # digest=4c263a3810af4ef4, dirty=1
+  --commands fx.commands.json      # digest=ab00722ca3ae679a, dirty=1
 ./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
 ```
 
 Measured result: `cmp` exits 0, both PPMs are 18445 bytes, and the FNV-1a 64
-digest of the PPM bytes is `1f9b7069c621028f`. The same test also proves
-equality at `64 48` (9229 bytes, PPM digest `7538c5a3976d1133`). This is a real
+digest of the PPM bytes is `292043461093fcd5`. The same test also proves
+equality at `64 48` (9229 bytes, PPM digest `51ba485cdab48339`). This is a real
 comparison against the independent software renderer, not a self-comparison.
 If the sibling renderer binary or fixture is absent, the test prints a clear
 `SKIP` message and claims no success.
