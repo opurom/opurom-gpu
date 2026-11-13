@@ -3,12 +3,13 @@
 Independent Rust crate: a **real macOS Metal compute backend** that fills an
 RGBA8 buffer with a solid colour plus a deterministic two-stop vertical
 gradient, reads the buffer back, and compares its bytes against an independent
-CPU reference. In capability it also **executes the exact display list dumped by
+CPU reference. It also **executes the exact display list dumped by
 `opurom-render --commands`** with a Metal compute kernel and writes a P6 PPM
-that is byte-identical to the independent software renderer. capability adds real MSL
-compute kernels for the five capability visual effects (blur, shadow, glow, glass,
-liquid), with a second cross-repo byte-equality proof for effect IR. capability keeps
-the capability compute output buffer on the GPU and presents it into a live AppKit
+that is byte-identical to the independent software renderer. Real MSL
+compute kernels cover the five visual effects (blur, shadow, glow, glass,
+liquid), with a second cross-repo byte-equality proof for effect IR. The
+presentation path keeps
+the compute output buffer on the GPU and presents it into a live AppKit
 `CAMetalLayer` drawable through a runtime-loaded C ABI. This folder is its own
 git repository. All files and comments are English.
 
@@ -37,12 +38,12 @@ Implemented now:
   dispatches one Metal thread per viewport pixel over `raster_batch`, reads the
   result back, and writes the renderer's exact P6 PPM format
   (`P6\n<w> <h>\n255\n` + RGB triplets).
-- capability effect commands: `snapshot_frame`, `build_mask`, `effect_local` and the
+- Effect commands: `snapshot_frame`, `build_mask`, `effect_local` and the
   two `blur_*` kernels run as separate committed compute passes over two
   ping-pong RGBA frame buffers, one backdrop snapshot and one silhouette-mask
   buffer. Each pass dispatches one thread per pixel; the final buffer is read
   back on the CPU.
-- capability presentation: `raster_buffer` retains the final `MTLBuffer` on the GPU.
+- Presentation: `raster_buffer` retains the final `MTLBuffer` on the GPU.
   `src/presentation.rs` exports `opr_present_display_list` from a cdylib; it
   sets an RGBA8 `CAMetalLayer`, calls `nextDrawable()`, copies the compute
   buffer into the drawable texture with a real `MTLBlitCommandEncoder`, then
@@ -56,7 +57,7 @@ interior uses the same fixed-point two-stop vertical gradient arithmetic as
 truncating signed integer division. The MSL kernel and the CPU oracle use the
 same integer order and packing, so the readback must byte-match.
 
-## capability display-list raster proof
+## Display-list raster proof
 
 `opurom-render --commands <out.json>` dumps the exact frame display list:
 viewport, opaque background, and every solid rect, rounded rect and two-stop
@@ -90,19 +91,20 @@ repositories, not a self-comparison against the same code. If the sibling
 renderer binary is absent, the test prints a clear `SKIP` message and does not
 claim success.
 
-**Honest scope:** text glyph compositing stays CPU-side in capability — glyphs reach
+Text glyph compositing stays CPU-side: glyphs reach
 the GPU only as pre-decomposed solid rectangles; there is no GPU glyph atlas,
-font shaping or full-scene GPU text. The capability raster command is headless; capability
-adds the real drawable presentation path below. There is no dirty-rect
+font shaping or full-scene GPU text. The `raster` command is headless; the
+drawable presentation path is described below. There is no dirty-rect
 integration, no Vulkan/ANGLE/D3D backend, no device conformance matrix and no
 fps claim. `dispatch_ms` remains host-side commit-to-completion latency, not an
 fps measurement.
 
-## capability GPU effect kernels and byte-equality proof
+## GPU effect kernels and byte-equality proof
 
-`opurom-render --commands` now emits optional effect commands with integer
-parameters for IR carrying the five capability effects. Effect-free streams stay
-byte-identical to capability. The seven capability command kinds are:
+`opurom-render --commands` also emits optional effect commands with integer
+parameters for IR carrying the five visual effects. Effect-free streams stay
+byte-identical to the plain display-list path. The seven effect command kinds
+are:
 
 | Kind | Integer parameters | Metal pass |
 | --- | --- | --- |
@@ -122,40 +124,40 @@ sees the previous pass's writes.
 
 The committed effect fixture is
 `../opurom-render/tests/fixtures/capability_effect.opuir.json` (all five effects).
-`tests/capability.rs` runs both binaries and the system `cmp`:
+`tests/effects.rs` runs both binaries and the system `cmp`:
 
 ```sh
 ../opurom-render/target/debug/opurom-render \
   ../opurom-render/tests/fixtures/capability_effect.opuir.json 96 64 cpu.ppm \
-  --commands fx.commands.json      # digest=eb9ce1cec41bac13, dirty=1
+  --commands fx.commands.json      # digest=4c263a3810af4ef4, dirty=1
 ./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
 ```
 
 Measured result: `cmp` exits 0, both PPMs are 18445 bytes, and the FNV-1a 64
-digest of the PPM bytes is `b493cd0714a4fb64`. The same test also proves
-equality at `64 48` (9229 bytes, PPM digest `70d42c01f7ee35b2`). This is a real
+digest of the PPM bytes is `1f9b7069c621028f`. The same test also proves
+equality at `64 48` (9229 bytes, PPM digest `7538c5a3976d1133`). This is a real
 comparison against the independent software renderer, not a self-comparison.
 If the sibling renderer binary or fixture is absent, the test prints a clear
 `SKIP` message and claims no success.
 
-**Honest scope:** the capability `raster` CLI itself is compute-only. capability adds real
-drawable presentation through `opurom-platform`; there is still no GPU text
+The `raster` CLI itself is compute-only. Drawable presentation is reached
+through `opurom-platform`; there is still no GPU text
 (glyphs remain CPU-decomposed solid rects), no Vulkan/ANGLE/D3D backend,
 no device conformance matrix and no fps claim. `dispatch_ms` remains host-side
 commit-to-completion latency. Non-macOS hosts return the documented
 `MetalUnavailable` error and the tests print `SKIP`.
 
-## capability real drawable presentation
+## Real drawable presentation
 
 `cargo build --offline` also produces `target/debug/libopurom_gpu.dylib`. The
 `opurom-platform` CLI opens a live `NSWindow` and loads this dylib at runtime
 with `dlopen`/`dlsym`; its own binary has no `objc2-metal` dependency and no
-`-framework Metal` link (the same pattern as the capability X11 runtime loader). The C
+`-framework Metal` link (the same pattern as the X11 runtime loader). The C
 entry point `opr_present_display_list(json, layer, reason, capacity)` takes the
-renderer's capability display-list JSON and the retained `CAMetalLayer` pointer. It:
+renderer's display-list JSON and the retained `CAMetalLayer` pointer. It:
 
-1. runs the capability display-list compute passes and **retains the final GPU
+1. runs the display-list compute passes and **retains the final GPU
    `MTLBuffer`** (`raster_buffer`), instead of reading it back to the CPU;
 2. sets the layer's device, RGBA8 pixel format and drawable size, then calls
    `nextDrawable()`;
@@ -181,6 +183,28 @@ bar) with **0 mismatching pixels of 30 000**, max channel delta 25 and
 `CHANNEL_TOLERANCE=32` / `MISMATCH_BUDGET_PERCENT=2.0`: **PASS**. This is one
 window and one frame, macOS/Metal only. There is no Vulkan/ANGLE/D3D backend,
 no GPU text shaping, no measured fps claim and no device conformance matrix.
+
+## Animated multi-frame presentation
+
+`opr_present_display_list_timed(json, layer, reason, capacity, timings)` is the
+per-frame C entry point for the bounded animation loop. It has the same status
+vocabulary as `opr_present_display_list` and additionally writes a `repr(C)`
+`FrameTimings { dispatch_ns, present_ns }` measured with `std::time::Instant`:
+`dispatch_ns` covers the Metal compute raster of that frame, `present_ns` covers
+drawable acquisition, the blit, `presentDrawable`, commit, completion and the
+layer contents refresh. Timings are zero unless the frame really presented.
+
+On every loop frame the layer contents is **rebound to the IOSurface of the
+drawable that was just presented**: `setContents(None)` in a committed
+`CATransaction`, a flush, then `setContents(Some(surface))` in another committed
+transaction and a flush. `CAMetalLayer` recycles a small IOSurface pool, so
+reassigning the same object without clearing it is a no-op for Core Animation
+and `cacheDisplay(in:to:)` would keep showing the first frame. The single-frame
+entry point keeps its original binding unchanged.
+
+The loop driver and capture live in `opurom-platform` under
+`--verify-gpu-animation-loop`; both are described there. This crate performs no
+window capture and makes no fps or smoothness claim.
 
 ## Commands
 
@@ -217,7 +241,7 @@ documented `MetalUnavailable` message before touching the output file.
 `dispatch_ms` is host-side commit-to-completion latency measured with
 `Instant`, not a GPU timestamp and not an fps measurement. Both `probe` and
 `self-test` are headless; they do not create a window or presentation layer.
-The capability dylib requires the live window supplied by `opurom-platform`.
+The presentation dylib requires the live window supplied by `opurom-platform`.
 
 ## Offline build and tests
 
@@ -238,12 +262,13 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **31 tests**
-(capability's 27 plus four capability presentation tests), including the two cross-repo `cmp`
-proofs in `tests/display.rs` and `tests/capability.rs`; GPU execution cannot be
+that no fake success occurs. On macOS, `cargo test --offline` runs **33 tests**
+(26 display-list and effect tests plus seven presentation tests), including the
+two cross-repo `cmp`
+proofs in `tests/display.rs` and `tests/effects.rs`; GPU execution cannot be
 validated by Linux CI.
 
-## Honest limits / capability+
+## Backend boundaries
 
 This is display-list work over rects plus five framebuffer effect kernels, with
 one real Metal drawable presentation path for one live AppKit window. Glyph
@@ -252,11 +277,11 @@ UI rasterizer. There is no Vulkan, ANGLE or D3D backend, no GPU text shaping,
 no texture atlas, no image decoding and no dirty-rect integration. There is no
 measured 120 fps claim, no benchmark claim, and no device conformance matrix:
 only the system default Metal device is queried. Other backends, GPU text and
-multi-device certification remain capability+ work.
+multi-device certification are planned for later releases.
 No Metal API call in this backend is substituted with a software stub; the only
 software implementation is the explicitly separate CPU parsing/oracle path used
 for unit tests, while `raster` always performs the Metal dispatch on macOS and
-the capability dylib always blits the compute buffer into a real drawable.
+the presentation dylib always blits the compute buffer into a real drawable.
 
 ## API notes
 
