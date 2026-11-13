@@ -351,6 +351,7 @@ impl DisplayList {
         for command in &self.commands {
             if let Some((rect, clip, radius)) = command.geometry() {
                 validate_geometry(rect, clip, radius, self.width, self.height)?;
+                validate_gradient_stops(command)?;
             } else {
                 validate_effect(command, self.width, self.height)?;
             }
@@ -682,6 +683,26 @@ fn validate_geometry(
     {
         return Err(GpuError::InvalidDisplayList(
             "clip extends outside the viewport".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mirrors the parser's stop invariant for directly-constructed gradients:
+/// both stops must carry the same alpha as the alpha field.
+fn validate_gradient_stops(command: &Command) -> Result<(), GpuError> {
+    let (top, bottom, alpha) = match *command {
+        Command::Gradient {
+            top, bottom, alpha, ..
+        }
+        | Command::GradientHorizontal {
+            top, bottom, alpha, ..
+        } => (top, bottom, alpha),
+        _ => return Ok(()),
+    };
+    if top[3] != alpha || bottom[3] != alpha {
+        return Err(GpuError::InvalidDisplayList(
+            "gradient stop alpha must match the alpha field".to_owned(),
         ));
     }
     Ok(())
@@ -1289,6 +1310,48 @@ mod tests {
                 "invalid case {index} returned {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn horizontal_gradient_stop_channels_stay_in_range() {
+        let json = header(4, 1, [0, 0, 0, 255], "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,1],\"clip\":[0,0,4,1],\"radius\":0,\"top\":[0,0,300,255],\"bottom\":[255,255,255,255],\"alpha\":255}");
+        let error = parse_display_list(&json).expect_err("out-of-range stop channel was accepted");
+        assert!(
+            matches!(error, GpuError::InvalidDisplayList(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("top must be 0..=255"), "{error}");
+    }
+
+    #[test]
+    fn inverted_horizontal_stops_are_valid_and_stay_byte_identical() {
+        // Reversed stop order is a legal gradient direction, not a validation
+        // failure; the descending integer lerp lands 1 above the final stop.
+        let inverted = "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,1],\"clip\":[0,0,4,1],\"radius\":0,\"top\":[255,255,255,255],\"bottom\":[0,0,0,255],\"alpha\":255}";
+        let parsed = parse_display_list(&header(4, 1, [0, 0, 0, 255], inverted)).unwrap();
+        let constructed = DisplayList {
+            width: 4,
+            height: 1,
+            background: [0, 0, 0, 255],
+            commands: vec![Command::GradientHorizontal {
+                rect: [0, 0, 4, 1],
+                clip: [0, 0, 4, 1],
+                radius: 0,
+                top: [255, 255, 255, 255],
+                bottom: [0, 0, 0, 255],
+                alpha: 255,
+            }],
+        };
+        assert_eq!(constructed, parsed);
+        assert_eq!(constructed.pack().unwrap(), parsed.pack().unwrap());
+        assert_eq!(
+            render_cpu_commands(&parsed).unwrap(),
+            [255, 255, 255, 255, 171, 171, 171, 255, 86, 86, 86, 255, 1, 1, 1, 255].to_vec()
+        );
+        assert_eq!(
+            render_cpu_commands(&constructed).unwrap(),
+            render_cpu_commands(&parsed).unwrap()
+        );
     }
 
     #[test]
