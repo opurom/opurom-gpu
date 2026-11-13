@@ -351,7 +351,39 @@ fn constructed_display_lists_reject_invalid_geometry_without_panicking() {
         }
     }
 
-    let cases: [(DisplayList, &str); 6] = [
+    let cases: [(DisplayList, &str); 8] = [
+        (
+            DisplayList {
+                width: 4,
+                height: 2,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::GradientHorizontal {
+                    rect: [0, 0, 0, 2],
+                    clip: [0, 0, 4, 2],
+                    radius: 0,
+                    top: [0, 0, 0, 255],
+                    bottom: [255, 255, 255, 255],
+                    alpha: 255,
+                }],
+            },
+            "positive width and height",
+        ),
+        (
+            DisplayList {
+                width: 4,
+                height: 2,
+                background: [0, 0, 0, 255],
+                commands: vec![Command::GradientHorizontal {
+                    rect: [0, 0, 4, 2],
+                    clip: [0, 0, 4, 2],
+                    radius: 0,
+                    top: [0, 0, 0, 255],
+                    bottom: [255, 255, 255, 200],
+                    alpha: 255,
+                }],
+            },
+            "gradient stop alpha must match the alpha field",
+        ),
         (
             DisplayList {
                 width: 2,
