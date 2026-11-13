@@ -11,7 +11,7 @@ liquid), with a second cross-repo byte-equality proof for effect IR. The
 presentation path keeps
 the compute output buffer on the GPU and presents it into a live AppKit
 `CAMetalLayer` drawable through a runtime-loaded C ABI. This folder is its own
-git repository. All files and comments are English.
+git repository.
 
 ## Scope
 
@@ -38,6 +38,9 @@ Implemented now:
   dispatches one Metal thread per viewport pixel over `raster_batch`, reads the
   result back, and writes the renderer's exact P6 PPM format
   (`P6\n<w> <h>\n255\n` + RGB triplets).
+- `gradient_horizontal`: a regular display-list command for a two-stop integer
+  gradient across columns, evaluated by both the CPU oracle and the
+  `raster_batch` MSL kernel with the same clipping, rounding and blend order.
 - No font bitmap lives in this crate: `opurom-render` rasterizes anti-aliased
   glyph coverage into 1x1 solid commands with fractional alpha, and Metal
   blends them with the same integer `/255` contract as the software raster.
@@ -70,6 +73,22 @@ stream on Metal: signed coordinates are encoded as `value + 2^30` for MSL's
 `int`, corners use the renderer's integer quarter-circle test, and alpha
 blending uses the renderer's `/255` integer blend, all evaluated per pixel in
 draw order.
+
+An additional regular command kind, `gradient_horizontal`, carries the same
+integer fields as `gradient` and interpolates its two stops across the rect
+width. Its `t` is `(x - rect.x) * 1024 / (rect.width - 1)`, or `1024` for a
+single-column rect; clipping, quarter-circle corners and the `/255` blend match
+the other regular commands. `src/display.rs` evaluates it in the CPU oracle and
+the `raster_batch` MSL kernel evaluates the identical integer expression, so a
+display list that mixes both orientations has both a CPU raster and a Metal
+raster. The parser applies the existing geometry, clip, radius, stop-alpha and
+coordinate-range checks to the new kind. Display lists produced by
+`opurom-render` keep their existing command kinds, so the PPM digests and the
+cross-repo equality proofs stay unchanged. Unit tests fix the column stops,
+negative rect origins, fractional-alpha blending, packing, pass order and
+malformed inputs; a macOS test compares the Metal readback against the CPU
+oracle for a stream containing both gradient orientations, a rounded rect and
+negative coordinates.
 
 The cross-repo test in `tests/display.rs` locates the sibling renderer binary
 `../opurom-render/target/debug/opurom-render` (override with
@@ -264,9 +283,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **33 tests**
-(26 display-list and effect tests plus seven presentation tests), including the
-two cross-repo `cmp`
+that no fake success occurs. On macOS, `cargo test --offline` runs **42 tests**
+(31 unit tests and eleven integration tests), including the two cross-repo `cmp`
 proofs in `tests/display.rs` and `tests/effects.rs`; GPU execution cannot be
 validated by Linux CI.
 
