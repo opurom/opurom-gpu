@@ -7,8 +7,10 @@ CPU reference. In R6 it also **executes the exact display list dumped by
 `opurom-render --commands`** with a Metal compute kernel and writes a P6 PPM
 that is byte-identical to the independent software renderer. R9 adds real MSL
 compute kernels for the five R8 visual effects (blur, shadow, glow, glass,
-liquid), with a second cross-repo byte-equality proof for effect IR. This folder
-is its own git repository. All files and comments are English.
+liquid), with a second cross-repo byte-equality proof for effect IR. R10 keeps
+the R9 compute output buffer on the GPU and presents it into a live AppKit
+`CAMetalLayer` drawable through a runtime-loaded C ABI. This folder is its own
+git repository. All files and comments are English.
 
 ## Scope
 
@@ -40,6 +42,13 @@ Implemented now:
   ping-pong RGBA frame buffers, one backdrop snapshot and one silhouette-mask
   buffer. Each pass dispatches one thread per pixel; the final buffer is read
   back on the CPU.
+- R10 presentation: `raster_buffer` retains the final `MTLBuffer` on the GPU.
+  `src/presentation.rs` exports `opr_present_display_list` from a cdylib; it
+  sets an RGBA8 `CAMetalLayer`, calls `nextDrawable()`, copies the compute
+  buffer into the drawable texture with a real `MTLBlitCommandEncoder`, then
+  calls `presentDrawable`, `commit` and `waitUntilCompleted`. The presented
+  drawable's own IOSurface is exposed as layer contents so the platform's
+  `cacheDisplay(in:to:)` can composite the exact GPU surface offscreen.
 
 The pixel contract is opaque RGBA8. An inset border uses the solid colour; the
 interior uses the same fixed-point two-stop vertical gradient arithmetic as
@@ -83,10 +92,11 @@ claim success.
 
 **Honest scope:** text glyph compositing stays CPU-side in R6 — glyphs reach
 the GPU only as pre-decomposed solid rectangles; there is no GPU glyph atlas,
-font shaping or full-scene GPU text. There is no GPU presentation to a window,
-no dirty-rect integration, no Vulkan/ANGLE/D3D backend, no device conformance
-matrix and no fps claim. `dispatch_ms` remains host-side commit-to-completion
-latency, not an fps measurement.
+font shaping or full-scene GPU text. The R6 raster command is headless; R10
+adds the real drawable presentation path below. There is no dirty-rect
+integration, no Vulkan/ANGLE/D3D backend, no device conformance matrix and no
+fps claim. `dispatch_ms` remains host-side commit-to-completion latency, not an
+fps measurement.
 
 ## R9 GPU effect kernels and byte-equality proof
 
@@ -129,11 +139,48 @@ comparison against the independent software renderer, not a self-comparison.
 If the sibling renderer binary or fixture is absent, the test prints a clear
 `SKIP` message and claims no success.
 
-**Honest scope:** compute kernels only. No GPU presentation to a window, no GPU
-text (glyphs remain CPU-decomposed solid rects), no Vulkan/ANGLE/D3D backend,
+**Honest scope:** the R9 `raster` CLI itself is compute-only. R10 adds real
+drawable presentation through `opurom-platform`; there is still no GPU text
+(glyphs remain CPU-decomposed solid rects), no Vulkan/ANGLE/D3D backend,
 no device conformance matrix and no fps claim. `dispatch_ms` remains host-side
 commit-to-completion latency. Non-macOS hosts return the documented
 `MetalUnavailable` error and the tests print `SKIP`.
+
+## R10 real drawable presentation
+
+`cargo build --offline` also produces `target/debug/libopurom_gpu.dylib`. The
+`opurom-platform` CLI opens a live `NSWindow` and loads this dylib at runtime
+with `dlopen`/`dlsym`; its own binary has no `objc2-metal` dependency and no
+`-framework Metal` link (the same pattern as the R8 X11 runtime loader). The C
+entry point `opr_present_display_list(json, layer, reason, capacity)` takes the
+renderer's R9 display-list JSON and the retained `CAMetalLayer` pointer. It:
+
+1. runs the R9 display-list compute passes and **retains the final GPU
+   `MTLBuffer`** (`raster_buffer`), instead of reading it back to the CPU;
+2. sets the layer's device, RGBA8 pixel format and drawable size, then calls
+   `nextDrawable()`;
+3. encodes `copyFromBuffer:...:toTexture:` on a real `MTLBlitCommandEncoder`,
+   calls `presentDrawable`, commits the command buffer and waits for completion;
+4. exposes the presented drawable's **own IOSurface** as layer contents, with no
+   CPU copy, so `cacheDisplay(in:to:)` can composite the exact on-screen GPU
+   surface (Core Animation's offscreen renderer cannot see window-server
+   drawable content directly).
+
+Status `0` means a real presentation. No Metal device, no drawable, a missing
+IOSurface, or a non-macOS host returns a documented SKIP status with a concrete
+reason; Metal/API errors return FAIL. No CPU `CGImage` substitution is used for
+the presented frame. Unit tests cover the blit geometry, the ordered
+`blit`/`presentDrawable`/`commit`/`wait` encoding, the skip statuses and the
+null-argument FFI path.
+
+The cross-repo verification command is
+`opurom-platform --verify-gpu-presentation` (see that repository's README).
+`OPR_SKIP_WINDOW=1` forces a documented SKIP. On the reference macOS arm64 /
+Apple M6 host, the real capture is a 200x182 PNG (200x150 content + 32 px title
+bar) with **0 mismatching pixels of 30 000**, max channel delta 25 and
+`CHANNEL_TOLERANCE=32` / `MISMATCH_BUDGET_PERCENT=2.0`: **PASS**. This is one
+window and one frame, macOS/Metal only. There is no Vulkan/ANGLE/D3D backend,
+no GPU text shaping, no measured fps claim and no device conformance matrix.
 
 ## Commands
 
@@ -170,46 +217,54 @@ documented `MetalUnavailable` message before touching the output file.
 `dispatch_ms` is host-side commit-to-completion latency measured with
 `Instant`, not a GPU timestamp and not an fps measurement. Both `probe` and
 `self-test` are headless; they do not create a window or presentation layer.
+The R10 dylib requires the live window supplied by `opurom-platform`.
 
 ## Offline build and tests
 
 ```sh
 cargo fmt --all
 cargo fmt --all -- --check
-cargo test --offline
-cargo build --offline
+RUSTFLAGS="-D warnings" cargo test --offline
+RUSTFLAGS="-D warnings" cargo build --offline
+RUSTFLAGS="-D warnings" cargo check --offline --tests --target x86_64-unknown-linux-gnu
 ```
 
-Metal dependencies appear only under
-`[target.'cfg(target_os = "macos")'.dependencies]` in `Cargo.toml`. Linux CI
-therefore builds and tests the pure-Rust parser, packer, pass builder,
-reference, validation, digest and error paths without Metal frameworks or Metal
-crates; `cargo check --tests --target x86_64-unknown-linux-gnu` is clean with
-`-D warnings`. On non-macOS, GPU commands return the documented
-`MetalUnavailable` error and exit nonzero; tests print a clear `SKIP` message
-(visible with `cargo test --offline -- --nocapture`) and assert that no fake
-success occurs. On macOS, `cargo test --offline` runs 27 tests, including the
-two cross-repo `cmp` proofs in `tests/display.rs` and `tests/r9.rs`; GPU
-execution cannot be validated by Linux CI.
+Metal, QuartzCore and IOSurface dependencies appear only under
+`[target.'cfg(target_os = "macos")'.dependencies]` in `Cargo.toml`; the C ABI
+and all presentation code are `cfg`-gated, so Linux CI builds and tests the
+pure-Rust parser, packer, pass builder, reference, validation, digest, blit
+geometry and error paths without Metal frameworks or Metal crates. The
+`cdylib` is loaded at runtime by `opurom-platform`; there is no link-time
+framework requirement in that binary. On non-macOS, GPU commands return the
+documented `MetalUnavailable` error and exit nonzero; tests print a clear
+`SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
+that no fake success occurs. On macOS, `cargo test --offline` runs **31 tests**
+(R9's 27 plus four R10 presentation tests), including the two cross-repo `cmp`
+proofs in `tests/display.rs` and `tests/r9.rs`; GPU execution cannot be
+validated by Linux CI.
 
-## Honest limits / R9+
+## Honest limits / R11+
 
-This is headless display-list work over rects plus five framebuffer effect
-kernels. Glyph shapes reach the GPU only as CPU-decomposed rectangles. It is
-**not** a full GPU UI rasterizer. There is no Vulkan, ANGLE, D3D, Metal
-presentation, texture atlas, glyph rendering, image decoding, or dirty-rect
-integration. There is no measured 120 fps claim, no benchmark claim, and no
-device conformance matrix: only the system default Metal device is queried.
-Other backends, presentation, GPU text and multi-device certification remain
-R10+ work.
+This is display-list work over rects plus five framebuffer effect kernels, with
+one real Metal drawable presentation path for one live AppKit window. Glyph
+shapes reach the GPU only as CPU-decomposed rectangles. It is **not** a full GPU
+UI rasterizer. There is no Vulkan, ANGLE or D3D backend, no GPU text shaping,
+no texture atlas, no image decoding and no dirty-rect integration. There is no
+measured 120 fps claim, no benchmark claim, and no device conformance matrix:
+only the system default Metal device is queried. Other backends, GPU text and
+multi-device certification remain R11+ work.
 No Metal API call in this backend is substituted with a software stub; the only
 software implementation is the explicitly separate CPU parsing/oracle path used
-for unit tests, while `raster` always performs the Metal dispatch on macOS.
+for unit tests, while `raster` always performs the Metal dispatch on macOS and
+the R10 dylib always blits the compute buffer into a real drawable.
 
 ## API notes
 
 `objc2-metal 0.3.2` exposes `MTLCreateSystemDefaultDevice` behind its
 `MTLDevice` feature and requires CoreGraphics to be linked; `src/metal.rs`
-adds that framework link. All source compilation is performed at runtime by
-`newLibraryWithSource`, so the build does not require a `.metallib` or an Xcode
-Metal Toolchain. No API limitation required replacing a requested Metal call.
+adds that framework link. `objc2-quartz-core 0.3.2` supplies `CAMetalLayer` and
+`nextDrawable()`, and `objc2-io-surface 0.3.2` exposes the presented drawable's
+own surface for `cacheDisplay`. All source compilation is performed at runtime
+by `newLibraryWithSource`, so the build does not require a `.metallib` or an
+Xcode Metal Toolchain. No API limitation required replacing a requested Metal
+call; the platform adapter resolves the C ABI with `dlopen`/`dlsym`.

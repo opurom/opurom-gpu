@@ -6,17 +6,19 @@
 //! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
 //! display list to Metal compute kernels. R9 adds five effect command types:
 //! blur, shadow, glow, glass and liquid execute as real multi-pass MSL kernels
-//! with frame snapshots and readback. Text glyph compositing stays CPU-side:
-//! glyphs reach the GPU only as pre-decomposed solid rectangles.
+//! with frame snapshots and readback. R10 retains the final compute buffer and
+//! presents it through a real CAMetalLayer drawable from the platform's live
+//! window. Text glyph compositing stays CPU-side: glyphs reach the GPU only as
+//! pre-decomposed solid rectangles.
 
 use std::fmt;
 use std::time::Duration;
 
 mod display;
-mod reference;
-
 #[cfg(target_os = "macos")]
 mod metal;
+pub mod presentation;
+mod reference;
 
 pub use display::{
     parse_display_list, render_cpu_commands, Command, DisplayList, Pass, COMMAND_WORDS, COORD_BIAS,
@@ -122,6 +124,8 @@ impl FrameParams {
 pub enum GpuError {
     /// Documented fallback when the host cannot expose a Metal device.
     MetalUnavailable(String),
+    /// The window is present but Core Animation cannot supply a drawable.
+    DrawableUnavailable(String),
     InvalidParameters(String),
     InvalidDisplayList(String),
     Metal(String),
@@ -145,6 +149,7 @@ impl fmt::Display for GpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MetalUnavailable(message) => write!(f, "MetalUnavailable: {message}"),
+            Self::DrawableUnavailable(message) => write!(f, "DrawableUnavailable: {message}"),
             Self::InvalidParameters(message) => write!(f, "InvalidParameters: {message}"),
             Self::InvalidDisplayList(message) => write!(f, "InvalidDisplayList: {message}"),
             Self::Metal(message) => write!(f, "Metal error: {message}"),

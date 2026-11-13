@@ -6,8 +6,9 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::mem::size_of;
 use std::slice;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
@@ -436,7 +437,7 @@ kernel void blur_vertical(
 }
 "#;
 
-fn ns_error(error: &NSError, context: &str) -> GpuError {
+pub(super) fn ns_error(error: &NSError, context: &str) -> GpuError {
     let description = error.localizedDescription();
     let domain = error.domain();
     GpuError::Metal(format!(
@@ -451,6 +452,30 @@ fn require_system_device<T>(device: Option<T>) -> Result<T, GpuError> {
     device.ok_or_else(|| {
         GpuError::MetalUnavailable("MTLCreateSystemDefaultDevice() returned nil".to_owned())
     })
+}
+
+/// The live R9 compute output, kept on the Metal device for presentation.
+pub(super) struct RasterFrame {
+    pub device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub device_name: String,
+    pub byte_count: usize,
+    pub dispatch_elapsed: Duration,
+}
+
+impl RasterFrame {
+    pub fn read_pixels(&self) -> Vec<u8> {
+        // SAFETY: shared-storage buffer, committed compute passes completed,
+        // and the allocation length was checked when it was created.
+        unsafe {
+            slice::from_raw_parts(
+                self.buffer.contents().as_ptr().cast::<u8>(),
+                self.byte_count,
+            )
+            .to_vec()
+        }
+    }
 }
 
 pub(super) fn render(params: &FrameParams, byte_count: usize) -> Result<GpuFrame, GpuError> {
@@ -561,6 +586,27 @@ pub(super) fn raster(
     passes: &[Pass],
     byte_count: usize,
 ) -> Result<GpuFrame, GpuError> {
+    let frame = raster_buffer(packed_commands, passes, byte_count)?;
+    let pixels = frame.read_pixels();
+    if pixels.len() != byte_count {
+        return Err(GpuError::Metal(format!(
+            "raster readback length {} does not match requested {byte_count}",
+            pixels.len()
+        )));
+    }
+    Ok(GpuFrame {
+        device_name: frame.device_name,
+        pixels,
+        dispatch_elapsed: frame.dispatch_elapsed,
+    })
+}
+
+/// Execute the same R9 passes but retain the final GPU buffer for a blit.
+pub(super) fn raster_buffer(
+    packed_commands: &[u32],
+    passes: &[Pass],
+    byte_count: usize,
+) -> Result<RasterFrame, GpuError> {
     let device = require_system_device(MTLCreateSystemDefaultDevice())?;
     let name = device.name();
     let device_name = (&*name).to_string();
@@ -693,21 +739,13 @@ pub(super) fn raster(
     }
     let dispatch_elapsed = started.elapsed();
 
-    let final_buffer = if current == 0 { &frame_a } else { &frame_b };
-    // SAFETY: shared-storage buffer, command completed, and length was checked.
-    let pixels = unsafe {
-        slice::from_raw_parts(final_buffer.contents().as_ptr().cast::<u8>(), byte_count).to_vec()
-    };
-    if pixels.len() != byte_count {
-        return Err(GpuError::Metal(format!(
-            "raster readback length {} does not match requested {byte_count}",
-            pixels.len()
-        )));
-    }
-
-    Ok(GpuFrame {
+    let final_buffer = if current == 0 { frame_a } else { frame_b };
+    Ok(RasterFrame {
+        device,
+        queue,
+        buffer: final_buffer,
         device_name,
-        pixels,
+        byte_count,
         dispatch_elapsed,
     })
 }
