@@ -87,6 +87,7 @@ constant uint COMMAND_WORDS = 16u;
 constant uint KIND_SOLID = 0u;
 constant uint KIND_ROUNDED = 1u;
 constant uint KIND_GRADIENT = 2u;
+constant uint KIND_GRADIENT_H = 3u;
 
 static inline uchar4 unpack_rgba(uint packed) {
     return uchar4(
@@ -245,10 +246,11 @@ kernel void raster_batch(
         if (px < clipx || py < clipy || px >= clipx + clipw || py >= clipy + cliph) continue;
         if (rad > 0 && outside_round(rx, ry, rw, rh, rad, px, py)) continue;
 
-        if (kind == KIND_GRADIENT) {
-            const long last = rh - 1L;
-            const long local_y = py - ry;
-            const long t = (last <= 0L) ? 1024L : (local_y * 1024L) / last;
+        if (kind == KIND_GRADIENT || kind == KIND_GRADIENT_H) {
+            const bool horizontal = kind == KIND_GRADIENT_H;
+            const long last = (horizontal ? rw : rh) - 1L;
+            const long local = horizontal ? (px - rx) : (py - ry);
+            const long t = (last <= 0L) ? 1024L : (local * 1024L) / last;
             const uchar4 top = unpack_rgba(cmds[base + 10u]);
             const uchar4 bottom = unpack_rgba(cmds[base + 11u]);
             const uchar alpha = uchar(cmds[base + 12u]);

@@ -243,6 +243,35 @@ fn metal_display_raster_reports_metal_unavailable() {
     ));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_horizontal_gradient_matches_cpu_unit_oracle() {
+    let json = r#"{"version":1,"width":6,"height":3,"background":[10,20,30,255],"commands":[
+{"kind":"gradient_horizontal","rect":[-2,-1,8,5],"clip":[0,0,6,3],"radius":0,"top":[200,100,0,255],"bottom":[0,50,200,255],"alpha":255},
+{"kind":"gradient_horizontal","rect":[1,1,4,2],"clip":[2,0,4,3],"radius":0,"top":[255,255,255,128],"bottom":[0,0,0,128],"alpha":128},
+{"kind":"rounded","rect":[2,0,3,3],"clip":[0,0,6,3],"radius":1,"color":[9,8,7,255]},
+{"kind":"gradient","rect":[0,1,6,2],"clip":[0,0,6,3],"radius":0,"top":[16,32,48,255],"bottom":[240,192,144,255],"alpha":255}
+]}"#;
+    let list = opurom_gpu::parse_display_list(json).expect("fixture must parse");
+    let cpu = opurom_gpu::render_cpu_commands(&list).expect("CPU oracle must render");
+    let gpu = opurom_gpu::raster_display(&list).expect("Metal raster must succeed");
+    assert_eq!(
+        gpu.pixels, cpu,
+        "Metal readback must byte-match the CPU oracle"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn metal_horizontal_gradient_matches_cpu_unit_oracle() {
+    skip("horizontal gradient raster requires macOS Metal; asserting MetalUnavailable instead");
+    let json = r#"{"version":1,"width":4,"height":1,"background":[0,0,0,255],"commands":[{"kind":"gradient_horizontal","rect":[0,0,4,1],"clip":[0,0,4,1],"radius":0,"top":[0,0,0,255],"bottom":[255,255,255,255],"alpha":255}]}"#;
+    assert!(matches!(
+        opurom_gpu::raster_json_ppm(json),
+        Err(opurom_gpu::GpuError::MetalUnavailable(_))
+    ));
+}
+
 #[test]
 fn ppm_encoding_and_byte_count_validate_inputs() {
     assert_eq!(

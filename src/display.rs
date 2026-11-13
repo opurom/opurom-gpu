@@ -38,6 +38,7 @@ const UNIT: i64 = 1024;
 const SOLID: u32 = 0;
 const ROUNDED: u32 = 1;
 const GRADIENT: u32 = 2;
+const GRADIENT_HORIZONTAL: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -53,6 +54,14 @@ pub enum Command {
         color: [u8; 4],
     },
     Gradient {
+        rect: [i64; 4],
+        clip: [i64; 4],
+        radius: i64,
+        top: [u8; 4],
+        bottom: [u8; 4],
+        alpha: u8,
+    },
+    GradientHorizontal {
         rect: [i64; 4],
         clip: [i64; 4],
         radius: i64,
@@ -124,6 +133,9 @@ impl Command {
             }
             | Command::Gradient {
                 rect, clip, radius, ..
+            }
+            | Command::GradientHorizontal {
+                rect, clip, radius, ..
             } => (rect, clip, radius),
             _ => return None,
         })
@@ -148,12 +160,23 @@ impl Command {
                 bottom,
                 alpha,
                 ..
+            }
+            | Command::GradientHorizontal {
+                rect,
+                top,
+                bottom,
+                alpha,
+                ..
             } => {
-                let last = rect[3] - 1;
+                let (last, local) = if matches!(*self, Command::GradientHorizontal { .. }) {
+                    (rect[2] - 1, x - rect[0])
+                } else {
+                    (rect[3] - 1, y - rect[1])
+                };
                 let t = if last <= 0 {
                     UNIT
                 } else {
-                    ((y - rect[1]) * UNIT) / last
+                    (local * UNIT) / last
                 };
                 Some([
                     mix_channel(top[0], bottom[0], t),
@@ -173,6 +196,7 @@ impl Command {
             Command::Solid { .. } => SOLID,
             Command::Rounded { .. } => ROUNDED,
             Command::Gradient { .. } => GRADIENT,
+            Command::GradientHorizontal { .. } => GRADIENT_HORIZONTAL,
             _ => unreachable!("regular command"),
         };
         for (offset, value) in rect.iter().enumerate() {
@@ -187,6 +211,9 @@ impl Command {
                 packed[10] = pack_rgba(color);
             }
             Command::Gradient {
+                top, bottom, alpha, ..
+            }
+            | Command::GradientHorizontal {
                 top, bottom, alpha, ..
             } => {
                 packed[10] = pack_rgba(top);
@@ -975,7 +1002,7 @@ fn parse_regular_command(
                 color,
             }
         }
-        "gradient" => {
+        "gradient" | "gradient_horizontal" => {
             parser.expect(b',', "after clip")?;
             parser.key("radius")?;
             let radius = parser.integer()?;
@@ -992,13 +1019,24 @@ fn parse_regular_command(
             if top[3] != alpha || bottom[3] != alpha {
                 return Err(parser.error("gradient stop alpha must match the alpha field"));
             }
-            Command::Gradient {
-                rect,
-                clip,
-                radius,
-                top,
-                bottom,
-                alpha,
+            if kind == "gradient_horizontal" {
+                Command::GradientHorizontal {
+                    rect,
+                    clip,
+                    radius,
+                    top,
+                    bottom,
+                    alpha,
+                }
+            } else {
+                Command::Gradient {
+                    rect,
+                    clip,
+                    radius,
+                    top,
+                    bottom,
+                    alpha,
+                }
             }
         }
         other => return Err(parser.error(format!("unsupported command kind {other:?}"))),
@@ -1150,6 +1188,107 @@ mod tests {
             render_cpu_commands(&parse_display_list(&reversed).unwrap()).unwrap(),
             pixels
         );
+    }
+
+    const HORIZONTAL_GRADIENT: &str = "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,1],\"clip\":[0,0,4,1],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255}";
+
+    #[test]
+    fn horizontal_gradient_interpolates_across_columns() {
+        let list = parse_display_list(&header(4, 1, [0, 0, 0, 255], HORIZONTAL_GRADIENT)).unwrap();
+        assert!(matches!(
+            list.commands[0],
+            Command::GradientHorizontal { .. }
+        ));
+        assert_eq!(
+            render_cpu_commands(&list).unwrap(),
+            [0, 0, 0, 255, 85, 85, 85, 255, 170, 170, 170, 255, 255, 255, 255, 255,].to_vec()
+        );
+
+        let negative = "{\"kind\":\"gradient_horizontal\",\"rect\":[-1,0,4,1],\"clip\":[0,0,3,1],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255}";
+        let list = parse_display_list(&header(3, 1, [0, 0, 0, 255], negative)).unwrap();
+        assert_eq!(
+            render_cpu_commands(&list).unwrap(),
+            [85, 85, 85, 255, 170, 170, 170, 255, 255, 255, 255, 255].to_vec()
+        );
+    }
+
+    #[test]
+    fn horizontal_gradient_clips_and_blends_fractional_alpha() {
+        let command = "{\"kind\":\"gradient_horizontal\",\"rect\":[1,0,3,2],\"clip\":[2,0,2,2],\"radius\":0,\"top\":[200,100,0,128],\"bottom\":[0,100,200,128],\"alpha\":128}";
+        let list = parse_display_list(&header(4, 2, [10, 20, 30, 255], command)).unwrap();
+        let row = [
+            10, 20, 30, 255, 10, 20, 30, 255, 55, 60, 65, 255, 5, 60, 115, 255,
+        ];
+        let mut expected = row.to_vec();
+        expected.extend_from_slice(&row);
+        assert_eq!(render_cpu_commands(&list).unwrap(), expected);
+    }
+
+    #[test]
+    fn gradient_orientations_keep_distinct_integer_stops() {
+        let stops = "\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255";
+        let horizontal = format!(
+            "{{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":0,{stops}}}"
+        );
+        let vertical = format!(
+            "{{\"kind\":\"gradient\",\"rect\":[0,0,2,2],\"clip\":[0,0,2,2],\"radius\":0,{stops}}}"
+        );
+        let horizontal_pixels = render_cpu_commands(
+            &parse_display_list(&header(2, 2, [0, 0, 0, 255], &horizontal)).unwrap(),
+        )
+        .unwrap();
+        let vertical_pixels = render_cpu_commands(
+            &parse_display_list(&header(2, 2, [0, 0, 0, 255], &vertical)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            horizontal_pixels,
+            [0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255].to_vec()
+        );
+        assert_eq!(
+            vertical_pixels,
+            [0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255].to_vec()
+        );
+        assert_ne!(horizontal_pixels, vertical_pixels);
+    }
+
+    #[test]
+    fn horizontal_gradient_packs_as_a_regular_command() {
+        let stream =
+            format!("{HORIZONTAL_GRADIENT},{{\"kind\":\"effect_backdrop\"}},{HORIZONTAL_GRADIENT}");
+        let list = parse_display_list(&header(4, 1, [0, 0, 0, 255], &stream)).unwrap();
+        assert_eq!(list.commands.len(), 3);
+        let (words, passes) = list.build_passes().unwrap();
+        assert_eq!(words.len(), 2 * COMMAND_WORDS);
+        assert_eq!(words[0], GRADIENT_HORIZONTAL);
+        assert_eq!(words[10], pack_rgba([0, 0, 0, 255]));
+        assert_eq!(words[11], pack_rgba([255, 255, 255, 255]));
+        assert_eq!(words[12], 255);
+        let kernels: Vec<u32> = passes.iter().map(|p| p.kernel).collect();
+        assert_eq!(
+            kernels,
+            vec![KERNEL_BATCH, KERNEL_BATCH, KERNEL_SNAPSHOT, KERNEL_BATCH,]
+        );
+        assert_eq!(passes[1].params[6], 1);
+        assert_eq!(passes[3].params[5], COMMAND_WORDS as u32);
+        assert_eq!(passes[3].params[6], 1);
+
+        let invalid = [
+            "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,2],\"clip\":[0,0,4,2],\"radius\":3,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255}",
+            "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,2],\"clip\":[0,0,5,2],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255}",
+            "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,2],\"clip\":[0,0,4,2],\"radius\":0,\"top\":[0,0,0,128],\"bottom\":[255,255,255,255],\"alpha\":128}",
+            "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,0],\"clip\":[0,0,4,2],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255],\"alpha\":255}",
+            "{\"kind\":\"gradient_horizontal\",\"rect\":[0,0,4,2],\"clip\":[0,0,4,2],\"radius\":0,\"top\":[0,0,0,255],\"bottom\":[255,255,255,255]}",
+        ];
+        for (index, command) in invalid.iter().enumerate() {
+            let json = header(4, 2, [0, 0, 0, 255], command);
+            let error =
+                parse_display_list(&json).expect_err(&format!("invalid case {index} was accepted"));
+            assert!(
+                matches!(error, GpuError::InvalidDisplayList(_)),
+                "invalid case {index} returned {error:?}"
+            );
+        }
     }
 
     #[test]
