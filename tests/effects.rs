@@ -13,7 +13,7 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
-const EFFECT_IR: &str = "../opurom-render/tests/fixtures/r9_effect.opuir.json";
+const EFFECT_IR: &str = "../opurom-render/tests/fixtures/effects.opuir.json";
 
 #[cfg(target_os = "macos")]
 fn sibling_renderer() -> Option<PathBuf> {
@@ -124,7 +124,7 @@ fn effect_gpu_ppm_is_byte_identical_to_independent_software_renderer() {
     };
     let ir = Path::new(EFFECT_IR);
     if !ir.is_file() {
-        skip("committed effect IR fixture ../opurom-render/tests/fixtures/r9_effect.opuir.json not found");
+        skip("committed effect IR fixture ../opurom-render/tests/fixtures/effects.opuir.json not found");
         return;
     }
     assert_effect_byte_equality(&renderer, ir, "96", "64", "all-five-effects");

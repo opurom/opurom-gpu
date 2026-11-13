@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
-const FIXTURE_IR: &str = "../opurom-render/tests/fixtures/r6_rect_gradient.opuir.json";
+const FIXTURE_IR: &str = "../opurom-render/tests/fixtures/rect-gradient.opuir.json";
 #[cfg(target_os = "macos")]
 const COUNTER_IR: &str = "../opurom-spec/counter.opuir.json";
 
@@ -262,4 +262,45 @@ fn ppm_encoding_and_byte_count_validate_inputs() {
         Err(opurom_gpu::GpuError::InvalidParameters(_))
     ));
     assert_eq!(opurom_gpu::display_byte_count(3, 4).unwrap(), 48);
+}
+
+#[test]
+fn frame_validation_and_display_byte_count_agree_on_boundaries() {
+    let red = [1u8, 2, 3];
+    let make = |w: u32, h: u32| {
+        opurom_gpu::FrameParams::new(
+            w,
+            h,
+            opurom_gpu::Rgb::new(red[0], red[1], red[2]),
+            opurom_gpu::Rgb::new(red[0], red[1], red[2]),
+            opurom_gpu::Rgb::new(red[0], red[1], red[2]),
+        )
+    };
+
+    let sizes = [
+        (0u32, 1u32),
+        (1, 0),
+        (1, 1),
+        (3, 4),
+        (opurom_gpu::MAX_DIMENSION, opurom_gpu::MAX_DIMENSION),
+        (opurom_gpu::MAX_DIMENSION + 1, 1),
+    ];
+    for (width, height) in sizes {
+        let via_frame = make(width, height).validate();
+        let via_count = opurom_gpu::display_byte_count(width, height);
+        assert_eq!(
+            via_frame.is_ok(),
+            via_count.is_ok(),
+            "validation paths disagree for {width}x{height}"
+        );
+        if let (Ok(frame_bytes), Ok(count_bytes)) = (via_frame, via_count) {
+            assert_eq!(frame_bytes, count_bytes, "{width}x{height}");
+        }
+    }
+
+    let max = opurom_gpu::MAX_DIMENSION as usize;
+    assert_eq!(
+        opurom_gpu::display_byte_count(opurom_gpu::MAX_DIMENSION, opurom_gpu::MAX_DIMENSION),
+        Ok(max * max * 4)
+    );
 }

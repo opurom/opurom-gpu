@@ -78,7 +78,7 @@ The cross-repo test in `tests/display.rs` locates the sibling renderer binary
 ```sh
 # rect/gradient fixture: cmp exit 0, byte-identical
 ../opurom-render/target/debug/opurom-render \
-  ../opurom-render/tests/fixtures/r6_rect_gradient.opuir.json 96 64 cpu.ppm \
+  ../opurom-render/tests/fixtures/rect-gradient.opuir.json 96 64 cpu.ppm \
   --commands fixture.commands.json
 ./target/debug/opurom-gpu raster fixture.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm   # exit 0
@@ -126,12 +126,12 @@ batches; a separate committed command buffer per pass guarantees that each pass
 sees the previous pass's writes.
 
 The committed effect fixture is
-`../opurom-render/tests/fixtures/r9_effect.opuir.json` (all five effects).
+`../opurom-render/tests/fixtures/effects.opuir.json` (all five effects).
 `tests/effects.rs` runs both binaries and the system `cmp`:
 
 ```sh
 ../opurom-render/target/debug/opurom-render \
-  ../opurom-render/tests/fixtures/r9_effect.opuir.json 96 64 cpu.ppm \
+  ../opurom-render/tests/fixtures/effects.opuir.json 96 64 cpu.ppm \
   --commands fx.commands.json      # digest=ab00722ca3ae679a, dirty=1
 ./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
@@ -212,7 +212,6 @@ window capture and makes no fps or smoothness claim.
 ## Commands
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --offline
 ./target/debug/opurom-gpu probe
 ./target/debug/opurom-gpu self-test
