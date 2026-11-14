@@ -159,9 +159,14 @@ fn raster_cli_error_paths_are_readable() {
             .unwrap()
     };
 
+    // Exercise the file/parse error paths through the software backend so the
+    // test runs on hosts without Metal (linux CI); Metal availability is its
+    // own documented error path, checked elsewhere.
     // Missing input file: exit 1 with a readable diagnostic.
     let out = run(&[
         "raster",
+        "--backend",
+        "software",
         missing.to_str().unwrap(),
         dir.join("out.ppm").to_str().unwrap(),
     ]);
@@ -172,6 +177,8 @@ fn raster_cli_error_paths_are_readable() {
     // Malformed display list: rejected before any GPU work, exit 1.
     let out = run(&[
         "raster",
+        "--backend",
+        "software",
         bad_json.to_str().unwrap(),
         dir.join("out.ppm").to_str().unwrap(),
     ]);
