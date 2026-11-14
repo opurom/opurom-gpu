@@ -16,7 +16,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use crate::display::{Pass, KERNEL_BLUR_V, KERNEL_EFFECT, PARAM_WORDS};
+use crate::display::{Pass, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_GAUSSIAN_V, PARAM_WORDS};
 use crate::{FrameParams, GpuError, GpuFrame};
 
 // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked on macOS.
@@ -464,6 +464,62 @@ kernel void blur_vertical(
         dst[long(tid) * 4L + k] = clamp_u8((sum + n / 2) / n);
     }
 }
+
+// Separable integer Gaussian (binomial) blur, one dimension per committed pass.
+// p[2]=radius r, p[3]=weight sum W, p[4..4+2r]=binomial weights C(2r,0..2r).
+// Edges clamp to the row/column; output rounds with (sum + W/2)/W.
+// gaussian_blur_cpu mirrors these two passes byte for byte.
+kernel void gaussian_horizontal(
+    device const uchar *src [[buffer(0)]],
+    device uchar *dst [[buffer(1)]],
+    constant uint *p [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint w = p[0];
+    const uint h = p[1];
+    const uint count = w * h;
+    if (tid >= count) return;
+    const long r = long(p[2]);
+    const long W = long(p[3]);
+    const long x = long(tid % w);
+    const long y = long(tid / w);
+    for (long k = 0; k < 4; ++k) {
+        long sum = 0;
+        for (long j = 0; j <= 2L * r; ++j) {
+            long sx = x + j - r;
+            if (sx < 0) sx = 0;
+            if (sx >= long(w)) sx = long(w) - 1L;
+            sum += long(src[(y * long(w) + sx) * 4L + k]) * long(p[4u + uint(j)]);
+        }
+        dst[long(tid) * 4L + k] = clamp_u8((sum + W / 2L) / W);
+    }
+}
+
+kernel void gaussian_vertical(
+    device const uchar *src [[buffer(0)]],
+    device uchar *dst [[buffer(1)]],
+    constant uint *p [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint w = p[0];
+    const uint h = p[1];
+    const uint count = w * h;
+    if (tid >= count) return;
+    const long r = long(p[2]);
+    const long W = long(p[3]);
+    const long x = long(tid % w);
+    const long y = long(tid / w);
+    for (long k = 0; k < 4; ++k) {
+        long sum = 0;
+        for (long j = 0; j <= 2L * r; ++j) {
+            long sy = y + j - r;
+            if (sy < 0) sy = 0;
+            if (sy >= long(h)) sy = long(h) - 1L;
+            sum += long(src[(sy * long(w) + x) * 4L + k]) * long(p[4u + uint(j)]);
+        }
+        dst[long(tid) * 4L + k] = clamp_u8((sum + W / 2L) / W);
+    }
+}
 "#;
 
 pub(super) fn ns_error(error: &NSError, context: &str) -> GpuError {
@@ -663,6 +719,8 @@ pub(super) fn raster_buffer(
         pipeline("effect_local")?,
         pipeline("blur_horizontal")?,
         pipeline("blur_vertical")?,
+        pipeline("gaussian_horizontal")?,
+        pipeline("gaussian_vertical")?,
     ];
     let queue = device
         .newCommandQueue()
@@ -718,7 +776,7 @@ pub(super) fn raster_buffer(
         };
         // The vertical blur reads the horizontal pass's output and writes the
         // current frame back, so its buffer roles are reversed.
-        let (buf0, buf1) = if pass.kernel == KERNEL_BLUR_V {
+        let (buf0, buf1) = if pass.kernel == KERNEL_BLUR_V || pass.kernel == KERNEL_GAUSSIAN_V {
             (secondary, primary)
         } else {
             (primary, secondary)
