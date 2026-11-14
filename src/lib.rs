@@ -19,6 +19,7 @@ mod display;
 mod metal;
 pub mod presentation;
 mod reference;
+pub mod vulkan;
 
 pub use display::{
     gaussian_blur_cpu, parse_display_list, render_cpu_commands, Command, DisplayList, Pass,
@@ -28,6 +29,104 @@ pub use display::{
     PARTICLE_MAX_RADIUS, PARTICLE_MAX_SEED,
 };
 pub use reference::{render_cpu, Rgb};
+pub use vulkan::{
+    decode_stream, encode_stream, record_stream, VkCommand, VkCopyBufferToImage, VkDispatch,
+    VkDraw, VkEffect, VkError, VkPipeline, VkPrimitive, VkRect2D, VulkanBackend,
+};
+
+/// Backend selected by `--backend`; `Software` is the in-crate CPU oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Metal,
+    Vulkan,
+    Software,
+}
+
+/// Honest per-host availability of each backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendAvailability {
+    /// The host can execute this backend on a live device.
+    Live,
+    /// The host records and encodes the backend without a live driver.
+    RecordOnly,
+    /// The host has no usable path for this backend.
+    Unavailable,
+}
+
+/// Honest availability description for the current host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendStatus {
+    pub backend: Backend,
+    pub availability: BackendAvailability,
+    pub note: &'static str,
+}
+
+impl Backend {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "metal" => Self::Metal,
+            "vulkan" => Self::Vulkan,
+            "software" => Self::Software,
+            _ => return None,
+        })
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+            Self::Software => "software",
+        }
+    }
+
+    /// What this host can actually do: Metal is live only on macOS, Vulkan is
+    /// record-only everywhere (no driver is loaded), the software oracle is
+    /// always live.
+    pub const fn available(self) -> BackendStatus {
+        let (availability, note) = match self {
+            Self::Metal => {
+                if cfg!(target_os = "macos") {
+                    (BackendAvailability::Live, "Metal compute on macOS")
+                } else {
+                    (
+                        BackendAvailability::Unavailable,
+                        "Metal compute requires macOS",
+                    )
+                }
+            }
+            Self::Vulkan => (
+                BackendAvailability::RecordOnly,
+                "Vulkan command recording only; no driver is loaded headless",
+            ),
+            Self::Software => (
+                BackendAvailability::Live,
+                "in-crate CPU oracle for the sharing pixel contract",
+            ),
+        };
+        BackendStatus {
+            backend: self,
+            availability,
+            note,
+        }
+    }
+
+    /// Execute a display list: Metal rasters, Vulkan records its command
+    /// stream, Software returns the CPU oracle PPM.
+    pub fn run_ppm(self, list: &DisplayList) -> Result<Vec<u8>, GpuError> {
+        match self {
+            Self::Metal => raster_display_ppm(list),
+            Self::Software => {
+                let pixels = render_cpu_commands(list)?;
+                ppm_bytes(list.width, list.height, &pixels)
+            }
+            Self::Vulkan => Err(GpuError::InvalidParameters(
+                "the Vulkan backend is record-only and produces no pixels; \
+                 use VulkanBackend::record/encode"
+                    .to_owned(),
+            )),
+        }
+    }
+}
 
 /// Bound one host allocation and keeps the MSL thread index in `uint` range.
 pub const MAX_DIMENSION: u32 = 4096;

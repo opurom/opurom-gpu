@@ -157,7 +157,7 @@ Text glyph compositing stays CPU-side: glyphs reach
 the GPU only as pre-decomposed solid rectangles; there is no GPU glyph atlas,
 font shaping or full-scene GPU text. The `raster` command is headless; the
 drawable presentation path is described below. There is no dirty-rect
-integration, no Vulkan/ANGLE/D3D backend, no device conformance matrix and no
+integration, no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below), no device conformance matrix and no
 fps claim. `dispatch_ms` remains host-side commit-to-completion latency, not an
 fps measurement.
 
@@ -219,10 +219,74 @@ If the sibling renderer binary or fixture is absent, the test prints a clear
 
 The `raster` CLI itself is compute-only. Drawable presentation is reached
 through `opurom-platform`; there is still no GPU text
-(glyphs remain CPU-decomposed solid rects), no Vulkan/ANGLE/D3D backend,
+(glyphs remain CPU-decomposed solid rects), no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below),
 no device conformance matrix and no fps claim. `dispatch_ms` remains host-side
 commit-to-completion latency. Non-macOS hosts return the documented
 `MetalUnavailable` error and the tests print `SKIP`.
+
+## Headless Vulkan command recorder
+
+`src/vulkan.rs` adds a real, headless-testable Vulkan backend. It is **not a
+stub and not a driver**: there is no `dlopen` of a Vulkan loader, no
+`VkInstance`, no queue submission, and no new crate dependency. It is a
+deterministic command-recording / translation layer that maps the same
+validated, packed display list Metal uploads into a typed Vulkan-style command
+stream, with integer-only validation and byte-deterministic encoding. This is
+honest about the host: `Backend::available()` reports Vulkan as
+**record-only** everywhere (no driver is loaded headless).
+
+Typed commands (`VkCommand`), matching the display-list primitives:
+
+| Variant | Vulkan equivalent | Source |
+| --- | --- | --- |
+| `BindPipeline { pipeline }` | `vkCmdBindPipeline` | one per draw / compute pass |
+| `SetScissor { rect }` | `vkCmdSetScissor` | one per draw, from the command clip |
+| `Draw(VkDraw)` | `vkCmdDraw` | solid, rounded, gradient, gradient_horizontal, particles |
+| `CopyBufferToImage(..)` | `vkCmdCopyBufferToImage` | initial background staging |
+| `Dispatch(VkDispatch)` | `vkCmdDispatch` | each effect compute pass |
+
+Regular rect primitives record a `TriangleList` draw of six vertices; particles
+record a `PointList` draw of `count` vertices. The current OPUROM display-list
+schema has no standalone triangle or image-source command, so `TriangleList`
+represents the geometric primitive and `CopyBufferToImage` represents the
+buffer-to-image upload. Each draw is preceded by its pipeline bind and scissor
+set, so the stream is self-describing. Effects map to compute dispatches:
+`Backdrop`, `Mask`, `Shadow`, `Glow`, `Glass`, `Liquid`, and the
+`Blur`/`Gaussian` horizontal+vertical passes.
+
+`VulkanBackend::record(&DisplayList)` returns `Vec<VkCommand>` or a typed
+`VkError`; it re-validates the list at the trust boundary (out-of-range rects,
+invalid clip regions, negative radii, unbounded particle counts, malformed
+display lists) and never panics. `VulkanBackend::encode()` produces a
+deterministic byte stream; the framing is documented at the top of
+`src/vulkan.rs` and summarised as:
+
+```text
+magic[8]="OPRVKCB0" | version:u32 | width:u32 | height:u32
+background:rgba8 | command_count:u64
+command_count * { tag:u8 | payload_len:u64 | payload }
+checksum:u64 = FNV-1a 64 over every preceding byte
+```
+
+`decode_stream` reverses the framing and rejects an unknown tag, an unexpected
+payload length, trailing bytes and a bad checksum with a typed error.
+
+Parity proof: `tests/vulkan.rs` records a fixture that contains every regular
+primitive and every effect pass, then asserts the recorded draw count equals
+the number of 16-word blocks the Metal/CPU `build_passes` packs, and that each
+draw's rect, scissor, colour, gradient stops or particle count/seed equal the
+display-list command it came from — derived from the fixture, never a hardcoded
+constant. Further tests prove byte-determinism, an exact decode round-trip,
+typed validation without panics, and honest `Backend` availability.
+
+Backend selector: `Backend::{Metal, Vulkan, Software}` with
+`Backend::available() -> BackendStatus { availability }`, where
+`BackendAvailability::{Live, RecordOnly, Unavailable}` is honest per host
+(Metal is live only on macOS; Vulkan is record-only; the software oracle is
+always live). CLI: `opurom-gpu backends` prints the table, `opurom-gpu
+vk-record <commands.json> <out.bin>` writes the encoded command buffer, and
+`opurom-gpu raster --backend software|metal <commands.json> <out.ppm>` selects
+the pixel backend (`--backend vulkan` is refused because it is record-only).
 
 ## Real drawable presentation
 
@@ -257,7 +321,7 @@ The cross-repo verification command is
 Apple M6 host, the real capture is a 200x182 PNG (200x150 content + 32 px title
 bar) with **0 mismatching pixels of 30 000**, max channel delta 25 and
 `CHANNEL_TOLERANCE=32` / `MISMATCH_BUDGET_PERCENT=2.0`: **PASS**. This is one
-window and one frame, macOS/Metal only. There is no Vulkan/ANGLE/D3D backend,
+window and one frame, macOS/Metal only. There is no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below),
 no GPU text shaping, no measured fps claim and no device conformance matrix.
 
 ## Animated multi-frame presentation
@@ -337,8 +401,9 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **51 tests**
-(38 unit tests and thirteen integration tests), including the cross-repo `cmp`
+that no fake success occurs. On macOS, `cargo test --offline` runs **72 tests**
+(42 unit tests and thirty integration tests, ten of which are the headless Vulkan
+recorder proofs), including the cross-repo `cmp`
 proofs in `tests/display.rs` and `tests/effects.rs` and the Metal/CPU equality
 proof for a mixed stream containing particles; GPU execution cannot be
 validated by Linux CI.
@@ -351,9 +416,9 @@ one real Metal drawable presentation path for one live AppKit window. Glyph
 shapes reach the GPU as CPU-decomposed rectangles, and the system default Metal device is the
 one queried. The dispatch path, the readback equality proof and the on-screen presentation
 comparison are the verified properties of this backend.
-No Metal API call in this backend is substituted with a software stub; the only
-software implementation is the explicitly separate CPU parsing/oracle path used
-for unit tests, while `raster` always performs the Metal dispatch on macOS and
+No Metal API call in this backend is substituted with a software stub. The only
+software implementations are the explicitly separate CPU parsing/oracle path used
+for unit tests and the headless Vulkan command *recorder* (record-only, no driver), while `raster` always performs the Metal dispatch on macOS and
 the presentation dylib always blits the compute buffer into a real drawable.
 
 ## API notes

@@ -48,11 +48,11 @@ pub struct Pass {
 }
 
 const UNIT: i64 = 1024;
-const SOLID: u32 = 0;
-const ROUNDED: u32 = 1;
-const GRADIENT: u32 = 2;
-const GRADIENT_HORIZONTAL: u32 = 3;
-const PARTICLES: u32 = 4;
+pub(crate) const SOLID: u32 = 0;
+pub(crate) const ROUNDED: u32 = 1;
+pub(crate) const GRADIENT: u32 = 2;
+pub(crate) const GRADIENT_HORIZONTAL: u32 = 3;
+pub(crate) const PARTICLES: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -965,7 +965,7 @@ fn effect_color(color: [u8; 4]) -> Result<(), GpuError> {
 }
 
 /// Validate an effect command at the parser trust boundary.
-fn validate_effect(command: &Command, width: u32, height: u32) -> Result<(), GpuError> {
+pub(crate) fn validate_effect(command: &Command, width: u32, height: u32) -> Result<(), GpuError> {
     let mut rect = [0i64; 4];
     let mut clip = [0i64; 4];
     let mut bounds = [0i64; 4];
