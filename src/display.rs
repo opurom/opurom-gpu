@@ -19,6 +19,12 @@ pub const EFFECT_MAX_RADIUS: i64 = 32;
 pub const EFFECT_MAX_OFFSET: i64 = 64;
 pub const EFFECT_UNIT: i64 = 1024;
 
+/// Bounds for the separable Gaussian blur command. Its binomial weights are
+/// packed into words 4..4+2r of the 28-word param block; r <= 8 keeps the
+/// kernel compact with a small power-of-two weight sum.
+pub const GAUSSIAN_MIN_RADIUS: i64 = 1;
+pub const GAUSSIAN_MAX_RADIUS: i64 = 8;
+
 /// Particle parameter bounds, shared with opurom-render's particle schema.
 pub const PARTICLE_MAX_COUNT: i64 = 512;
 pub const PARTICLE_MAX_RADIUS: i64 = 32;
@@ -32,6 +38,8 @@ pub const KERNEL_MASK: u32 = 2;
 pub const KERNEL_EFFECT: u32 = 3;
 pub const KERNEL_BLUR_H: u32 = 4;
 pub const KERNEL_BLUR_V: u32 = 5;
+pub const KERNEL_GAUSSIAN_H: u32 = 6;
+pub const KERNEL_GAUSSIAN_V: u32 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pass {
@@ -129,6 +137,10 @@ pub enum Command {
     },
     /// Whole-frame box blur, applied after every node in layout order.
     EffectBlur { radius: i64 },
+    /// Whole-frame separable Gaussian (binomial) blur over a bounded radius.
+    /// Flutter's `BoxShadow.toPaint` uses a Gaussian `MaskFilter.blur`; this
+    /// bell-shaped kernel avoids the ringing of the uniform box blur.
+    EffectGaussianBlur { radius: i64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,6 +331,24 @@ fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>
     let mut p = base_params(width, height);
     match *command {
         Command::EffectBackdrop => one(KERNEL_SNAPSHOT, p),
+        Command::EffectGaussianBlur { radius } => {
+            let (sum, weights) = gaussian_weights(radius);
+            p[2] = radius as u32;
+            p[3] = sum as u32;
+            for j in 0..weights.len() {
+                p[4 + j] = weights[j] as u32;
+            }
+            Ok(vec![
+                Pass {
+                    kernel: KERNEL_GAUSSIAN_H,
+                    params: p,
+                },
+                Pass {
+                    kernel: KERNEL_GAUSSIAN_V,
+                    params: p,
+                },
+            ])
+        }
         Command::EffectBlur { radius } => {
             p[2] = radius as u32;
             Ok(vec![
@@ -583,6 +613,78 @@ pub fn render_cpu_commands(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
         }
     }
     Ok(pixels)
+}
+
+/// Binomial row `C(2r, 0..=2r)`: an integer, deterministic discrete-Gaussian
+/// kernel whose weights sum to `2^(2r)`. Both the CPU reference and the packed
+/// Metal params derive from this one function, so their weights are identical.
+fn gaussian_weights(radius: i64) -> (i64, Vec<i64>) {
+    let n = 2 * radius;
+    let mut weights = vec![1i64; (n + 1) as usize];
+    for k in 1..=n as usize {
+        weights[k] = weights[k - 1] * (n - k as i64 + 1) / k as i64;
+    }
+    let sum: i64 = weights.iter().sum();
+    (sum, weights)
+}
+
+/// Integer CPU reference for the two separable Metal Gaussian passes. The
+/// horizontal then vertical 1D convolutions use the same binomial weights,
+/// clamped edges and `(sum + W/2)/W` half-up rounding as `gaussian_horizontal`
+/// and `gaussian_vertical`, so the returned RGBA bytes match the GPU readback.
+pub fn gaussian_blur_cpu(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    radius: i64,
+) -> Result<Vec<u8>, GpuError> {
+    effect_range(
+        radius,
+        GAUSSIAN_MIN_RADIUS,
+        GAUSSIAN_MAX_RADIUS,
+        "gaussian radius",
+    )?;
+    let byte_count = crate::display_byte_count(width, height)?;
+    if pixels.len() != byte_count {
+        return Err(GpuError::InvalidParameters(format!(
+            "RGBA length {} does not match {byte_count}",
+            pixels.len()
+        )));
+    }
+    let (sum, weights) = gaussian_weights(radius);
+    let (w, h, r) = (width as i64, height as i64, radius);
+    let taps = 2 * r;
+    let mut horizontal = vec![0u8; byte_count];
+    for y in 0..h {
+        for x in 0..w {
+            for k in 0..4i64 {
+                let mut acc = 0i64;
+                for j in 0..=taps {
+                    let sx = (x + j - r).clamp(0, w - 1);
+                    let idx = ((y * w + sx) * 4 + k) as usize;
+                    acc += i64::from(pixels[idx]) * weights[j as usize];
+                }
+                let out = (acc + sum / 2) / sum;
+                horizontal[((y * w + x) * 4 + k) as usize] = out.clamp(0, 255) as u8;
+            }
+        }
+    }
+    let mut blurred = vec![0u8; byte_count];
+    for y in 0..h {
+        for x in 0..w {
+            for k in 0..4i64 {
+                let mut acc = 0i64;
+                for j in 0..=taps {
+                    let sy = (y + j - r).clamp(0, h - 1);
+                    let idx = ((sy * w + x) * 4 + k) as usize;
+                    acc += i64::from(horizontal[idx]) * weights[j as usize];
+                }
+                let out = (acc + sum / 2) / sum;
+                blurred[((y * w + x) * 4 + k) as usize] = out.clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(blurred)
 }
 
 struct Parser<'a> {
@@ -875,6 +977,14 @@ fn validate_effect(command: &Command, width: u32, height: u32) -> Result<(), Gpu
     let mut has_geometry = false;
     match *command {
         Command::EffectBackdrop => return Ok(()),
+        Command::EffectGaussianBlur { radius } => {
+            return effect_range(
+                radius,
+                GAUSSIAN_MIN_RADIUS,
+                GAUSSIAN_MAX_RADIUS,
+                "gaussian radius",
+            );
+        }
         Command::EffectBlur { radius: r } => radius = r,
         Command::EffectMask {
             rect: r,
@@ -1002,6 +1112,11 @@ fn parse_effect_command(
         "effect_backdrop" => {
             parser.expect(b'}', "after effect_backdrop")?;
             Command::EffectBackdrop
+        }
+        "effect_gaussian_blur" => {
+            let radius = field_i64(parser, "radius")?;
+            parser.expect(b'}', "after effect_gaussian_blur")?;
+            Command::EffectGaussianBlur { radius }
         }
         "effect_blur" => {
             let radius = field_i64(parser, "radius")?;

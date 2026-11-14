@@ -4,12 +4,11 @@
 //! code is compiled only on macOS; other targets return `MetalUnavailable`.
 //!
 //! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
-//! display list to Metal compute kernels. Five effect command types are
-//! supported: blur, shadow, glow, glass and liquid execute as real multi-pass
-//! MSL kernels with frame snapshots and readback. The presentation path retains
-//! the final compute buffer and
-//! presents it through a real CAMetalLayer drawable from the platform's live
-//! window. Text glyph compositing stays CPU-side: glyphs reach the GPU only as
+//! display list to Metal compute kernels. Six effect command types are
+//! supported: blur, Gaussian blur, shadow, glow, glass and liquid execute as
+//! real multi-pass MSL kernels with frame snapshots and readback. The
+//! presentation path retains the final compute buffer and presents it through a
+//! real CAMetalLayer drawable from the platform's live window. Text glyph compositing stays CPU-side: glyphs reach the GPU only as
 //! pre-decomposed solid rectangles.
 
 use std::fmt;
@@ -22,10 +21,11 @@ pub mod presentation;
 mod reference;
 
 pub use display::{
-    parse_display_list, render_cpu_commands, Command, DisplayList, Pass, COMMAND_WORDS, COORD_BIAS,
-    KERNEL_BATCH, KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_MASK, KERNEL_SNAPSHOT,
-    MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS, PARTICLE_MAX_COUNT, PARTICLE_MAX_RADIUS,
-    PARTICLE_MAX_SEED,
+    gaussian_blur_cpu, parse_display_list, render_cpu_commands, Command, DisplayList, Pass,
+    COMMAND_WORDS, COORD_BIAS, GAUSSIAN_MAX_RADIUS, GAUSSIAN_MIN_RADIUS, KERNEL_BATCH,
+    KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_GAUSSIAN_H, KERNEL_GAUSSIAN_V, KERNEL_MASK,
+    KERNEL_SNAPSHOT, MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS, PARTICLE_MAX_COUNT,
+    PARTICLE_MAX_RADIUS, PARTICLE_MAX_SEED,
 };
 pub use reference::{render_cpu, Rgb};
 

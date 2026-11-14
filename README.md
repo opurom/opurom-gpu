@@ -54,6 +54,12 @@ Implemented now:
   ping-pong RGBA frame buffers, one backdrop snapshot and one silhouette-mask
   buffer. Each pass dispatches one thread per pixel; the final buffer is read
   back on the CPU.
+- `effect_gaussian_blur`: a whole-frame separable Gaussian (binomial) blur over
+  a bounded radius `1..=8`, validated at parse time and in
+  `DisplayList::validate()`. Integer-only and deterministic: `gaussian_blur_cpu`
+  and the two `gaussian_*` MSL kernels share the same packed weights, clamped
+  edges and half-up rounding, so the CPU reference is byte-identical to the
+  Metal readback. Inspired by Flutter's Gaussian `MaskFilter.blur` box shadows.
 - Presentation: `raster_buffer` retains the final `MTLBuffer` on the GPU.
   `src/presentation.rs` exports `opr_present_display_list` from a cdylib; it
   sets an RGBA8 `CAMetalLayer`, calls `nextDrawable()`, copies the compute
@@ -159,7 +165,7 @@ fps measurement.
 
 `opurom-render --commands` also emits optional effect commands with integer
 parameters for IR carrying the five visual effects. Effect-free streams stay
-byte-identical to the plain display-list path. The seven effect command kinds
+byte-identical to the plain display-list path. The eight effect command kinds
 are:
 
 | Kind | Integer parameters | Metal pass |
@@ -171,12 +177,26 @@ are:
 | `effect_glass` | rect, clip, bounds, shape radius, radius, alpha, colour | `effect_local` with a two-pass blurred backdrop |
 | `effect_liquid` | rect, clip, bounds, shape radius, denom, alpha, colour | `effect_local` with the integer specular band |
 | `effect_blur` | radius | `blur_horizontal` + `blur_vertical` over the whole frame |
+| `effect_gaussian_blur` | radius (1..=8) | `gaussian_horizontal` + `gaussian_vertical` over the whole frame |
 
 All arithmetic is integer and mirrors the software renderer exactly: box-blur
 half-up rounding, `(src*a + dst*(255-a) + 127)/255` effect blending, clamped
 edge windows and the same pre-order draw order. Regular commands are packed into
 batches; a separate committed command buffer per pass guarantees that each pass
 sees the previous pass's writes.
+
+`effect_gaussian_blur` is a sixth visual effect that improves shadow and backdrop
+quality: Flutter's `BoxShadow.toPaint` blurs its shadows with a Gaussian
+`MaskFilter.blur`, while the plain `effect_blur` is a uniform box blur whose
+square kernel rings around hard edges. The new command convolves the whole frame
+with a separable binomial (discrete-Gaussian) kernel of half-width `radius`,
+bounded to `1..=8` and checked both when parsing and in `DisplayList::validate()`.
+Weights are exact integers (row `C(2r, 0..=2r)`, sum `2^(2r)`) packed into the
+28-word pass params; `gaussian_blur_cpu` and the two `gaussian_*` MSL kernels
+read the same weights, clamp edges and round with `(sum + W/2)/W`, so the CPU
+reference path is byte-identical to the Metal readback (proved on macOS in
+`tests/gaussian.rs`). This is a GPU-side effect with an in-crate CPU oracle; it
+does not change the existing five-effect cross-repo fixture or any golden digest.
 
 The committed effect fixture is
 `../opurom-render/tests/fixtures/effects.opuir.json` (all five effects).
