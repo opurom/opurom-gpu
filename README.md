@@ -59,7 +59,7 @@ Implemented now:
   `DisplayList::validate()`. Integer-only and deterministic: `gaussian_blur_cpu`
   and the two `gaussian_*` MSL kernels share the same packed weights, clamped
   edges and half-up rounding, so the CPU reference is byte-identical to the
-  Metal readback. Inspired by a framework's Gaussian `Gaussian blur` box shadows.
+  Metal readback.
 - Presentation: `raster_buffer` retains the final `MTLBuffer` on the GPU.
   `src/presentation.rs` exports `opr_present_display_list` from a cdylib; it
   sets an RGBA8 `CAMetalLayer`, calls `nextDrawable()`, copies the compute
@@ -186,8 +186,8 @@ batches; a separate committed command buffer per pass guarantees that each pass
 sees the previous pass's writes.
 
 `effect_gaussian_blur` is a sixth visual effect that improves shadow and backdrop
-quality: shadow painting blurs its shadows with a Gaussian
-`Gaussian blur`, while the plain `effect_blur` is a uniform box blur whose
+quality: shadows blur with a Gaussian
+`MaskFilter.blur`, while the plain `effect_blur` is a uniform box blur whose
 square kernel rings around hard edges. The new command convolves the whole frame
 with a separable binomial (discrete-Gaussian) kernel of half-width `radius`,
 bounded to `1..=8` and checked both when parsing and in `DisplayList::validate()`.

@@ -138,7 +138,7 @@ pub enum Command {
     /// Whole-frame box blur, applied after every node in layout order.
     EffectBlur { radius: i64 },
     /// Whole-frame separable Gaussian (binomial) blur over a bounded radius.
-    /// shadow painting uses a Gaussian `Gaussian blur`; this
+    /// Gaussian blur shadows; this
     /// bell-shaped kernel avoids the ringing of the uniform box blur.
     EffectGaussianBlur { radius: i64 },
 }
