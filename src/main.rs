@@ -1,8 +1,8 @@
 //! CLI: `probe`, `self-test`, `backends`, `vk-record`, and the
 //! `raster [--backend metal|software|vulkan] <commands.json> <out.ppm>`
 //! execution command. Selecting an unavailable backend fails with a clear
-//! diagnostic; the Vulkan backend is record-only and has its own `vk-record`
-//! command that writes the encoded command buffer instead of pixels.
+//! diagnostic; `vk-record` writes the recorded command buffer, while
+//! `raster --backend vulkan` dispatches the committed SPIR-V kernels.
 
 use std::{env, fs, process};
 
@@ -67,12 +67,6 @@ fn raster(backend: Backend, commands: &str, out: &str) -> Result<(), String> {
             backend.name(),
             status.note
         ));
-    }
-    if backend == Backend::Vulkan {
-        return Err(
-            "the Vulkan backend is record-only; use `vk-record <commands.json> <out.bin>`"
-                .to_owned(),
-        );
     }
     let json = fs::read_to_string(commands)
         .map_err(|e| format!("cannot read display list {commands:?}: {e}"))?;

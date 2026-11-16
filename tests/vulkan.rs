@@ -3,6 +3,8 @@
 //! the recorded stream against the Metal/CPU reference packing.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use opurom_gpu::{
     decode_stream, encode_stream, parse_display_list, record_stream, Backend, BackendAvailability,
@@ -474,22 +476,33 @@ fn backend_selector_reports_honest_availability() {
             note: Backend::Software.available().note,
         }
     );
-    // Vulkan availability is probed honestly: hosts with a real driver report
-    // record-only while the pixel compute pipeline is pending, and every other
-    // host reports exactly why it is unavailable.
+    // Vulkan availability is probed honestly: hosts with a real driver are
+    // live, and every other host reports exactly why it is unavailable.
     assert!(matches!(
         Backend::Vulkan.available().availability,
-        BackendAvailability::RecordOnly | BackendAvailability::Unavailable
+        BackendAvailability::Live | BackendAvailability::Unavailable
     ));
 
-    // Software runs the CPU oracle and yields a P6 PPM; Vulkan never pretends to
-    // produce pixels.
+    // Software runs the CPU oracle and yields a P6 PPM. Vulkan only promises
+    // pixels on a host where the probe found a usable driver.
     let list = full_list();
     let ppm = Backend::Software
         .run_ppm(&list)
         .expect("software must render");
     assert!(ppm.starts_with(b"P6\n"));
-    assert!(Backend::Vulkan.run_ppm(&list).is_err());
+    let vulkan = Backend::Vulkan.run_ppm(&list);
+    if opurom_gpu::vulkan_probe().usable() {
+        assert_eq!(
+            vulkan.expect("vulkan must execute on a probed driver"),
+            ppm,
+            "vulkan compute must byte-match the CPU oracle"
+        );
+    } else {
+        assert!(
+            vulkan.is_err(),
+            "without a driver Vulkan must refuse honestly"
+        );
+    }
 
     assert_eq!(Backend::parse("vulkan"), Some(Backend::Vulkan));
     assert_eq!(Backend::parse("metal"), Some(Backend::Metal));
@@ -498,8 +511,8 @@ fn backend_selector_reports_honest_availability() {
 }
 
 /// The loader probe is cached, honest about the device it found, and drives
-/// the backend availability: usable hosts report record-only, every other
-/// host reports why it is unavailable. Recording never touches the driver.
+/// the backend availability: usable hosts are live, every other host reports
+/// why it is unavailable. Recording never touches the driver.
 #[test]
 fn vulkan_probe_reports_what_the_host_has() {
     let probe = opurom_gpu::vulkan_probe();
@@ -519,7 +532,7 @@ fn vulkan_probe_reports_what_the_host_has() {
         );
         assert_eq!(
             Backend::Vulkan.available().availability,
-            BackendAvailability::RecordOnly
+            BackendAvailability::Live
         );
         // Recording stays driver-free and byte-deterministic even on hosts
         // with a live driver.
@@ -539,7 +552,7 @@ fn vulkan_probe_reports_what_the_host_has() {
 /// driver, the probed Vulkan device detail line.
 #[test]
 fn backends_cli_reports_three_backends_and_vulkan_detail() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opurom-gpu"))
+    let out = ProcessCommand::new(env!("CARGO_BIN_EXE_opurom-gpu"))
         .arg("backends")
         .output()
         .expect("backends must run");
@@ -550,5 +563,93 @@ fn backends_cli_reports_three_backends_and_vulkan_detail() {
     assert!(stdout.contains("software="));
     if opurom_gpu::vulkan_probe().usable() {
         assert!(stdout.contains("vulkan.device="));
+    }
+}
+
+/// A compact display list carrying every regular kind and all eight effect
+/// kinds, used for the Vulkan/CPU byte-equality gate.
+const EXEC_FIXTURE: &str = r#"{"version":1,"width":32,"height":24,"background":[30,40,50,255],"commands":[
+{"kind":"solid","rect":[0,0,32,24],"clip":[0,0,32,24],"color":[30,40,50,255]},
+{"kind":"rounded","rect":[4,4,10,8],"clip":[0,0,32,24],"radius":2,"color":[200,80,40,255]},
+{"kind":"gradient_horizontal","rect":[16,4,12,8],"clip":[0,0,32,24],"radius":0,"top":[10,20,30,255],"bottom":[220,180,140,255],"alpha":255},
+{"kind":"particles","rect":[8,12,16,8],"clip":[0,0,32,24],"count":10,"seed":3,"radius":1,"color":[255,255,255,255]},
+{"kind":"effect_backdrop"},
+{"kind":"effect_mask","rect":[4,4,10,8],"clip":[0,0,32,24],"bounds":[2,2,14,12],"shape_radius":2,"shape":1},
+{"kind":"effect_shadow","bounds":[2,2,14,12],"radius":2,"dx":2,"dy":1,"alpha":512,"color":[0,0,0,255]},
+{"kind":"effect_glow","bounds":[16,4,12,8],"radius":2,"alpha":512,"color":[40,255,120,255]},
+{"kind":"effect_glass","rect":[4,4,10,8],"clip":[0,0,32,24],"bounds":[2,2,14,12],"shape_radius":2,"radius":2,"alpha":512,"color":[255,255,255,255]},
+{"kind":"effect_liquid","rect":[16,4,12,8],"clip":[0,0,32,24],"bounds":[16,4,12,8],"shape_radius":0,"denom":24,"alpha":512,"color":[255,200,40,255]},
+{"kind":"effect_blur","radius":1},
+{"kind":"effect_gaussian_blur","radius":2}
+]}"#;
+
+fn vulkan_skip(message: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "SKIP: {message}");
+}
+
+/// Vulkan executes the same ordered pass plan as Metal over committed SPIR-V.
+/// Integer-only kernels make the bytes comparable: a driver arithmetic
+/// difference is a real failure, never an "approximately equal" pass.
+#[test]
+fn vulkan_execute_matches_software_oracle() {
+    if !opurom_gpu::vulkan_probe().usable() {
+        vulkan_skip("no probed Vulkan compute device; execute gate is CI-verified on lavapipe");
+        return;
+    }
+    let list = parse_display_list(EXEC_FIXTURE).expect("fixture must parse");
+    let cpu = Backend::Software
+        .run_ppm(&list)
+        .expect("software oracle must render");
+    let gpu = Backend::Vulkan.run_ppm(&list).expect("vulkan must execute");
+    assert_eq!(
+        gpu, cpu,
+        "vulkan compute must byte-match the software oracle"
+    );
+    let again = Backend::Vulkan
+        .run_ppm(&list)
+        .expect("vulkan must execute twice");
+    assert_eq!(again, gpu, "repeated vulkan renders must be byte-identical");
+    println!(
+        "PROOF vulkan-execute: cmp=identical bytes={} digest={}",
+        cpu.len(),
+        opurom_gpu::digest_hex(&cpu)
+    );
+}
+
+/// The CLI refuses honestly without a driver and executes with one; the
+/// resulting PPM must equal the software backend's bytes.
+#[test]
+fn raster_vulkan_cli_honest_execution() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let commands = dir.join("vulkan-execute.commands.json");
+    let output = dir.join("vulkan-execute.ppm");
+    std::fs::write(&commands, EXEC_FIXTURE).expect("fixture must be writable");
+    let run = ProcessCommand::new(env!("CARGO_BIN_EXE_opurom-gpu"))
+        .arg("raster")
+        .arg("--backend")
+        .arg("vulkan")
+        .arg(&commands)
+        .arg(&output)
+        .output()
+        .expect("raster must run");
+    if opurom_gpu::vulkan_probe().usable() {
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let list = parse_display_list(EXEC_FIXTURE).expect("fixture must parse");
+        assert_eq!(
+            std::fs::read(&output).expect("vulkan PPM must exist"),
+            Backend::Software
+                .run_ppm(&list)
+                .expect("software oracle must render"),
+            "the CLI must write the oracle's bytes"
+        );
+    } else {
+        assert_eq!(run.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&run.stderr).contains("unavailable"));
     }
 }

@@ -23,6 +23,7 @@ mod metal;
 pub mod presentation;
 mod reference;
 pub mod vulkan;
+mod vulkan_device;
 mod vulkan_loader;
 
 pub use display::{
@@ -103,8 +104,8 @@ impl Backend {
                 let probe = vulkan_probe();
                 if probe.usable() {
                     (
-                        BackendAvailability::RecordOnly,
-                        "Vulkan driver present; recording only; pixel compute execution pending",
+                        BackendAvailability::Live,
+                        "Vulkan compute on a probed real device",
                     )
                 } else {
                     (BackendAvailability::Unavailable, probe.note)
@@ -122,8 +123,8 @@ impl Backend {
         }
     }
 
-    /// Execute a display list: Metal rasters, Vulkan records its command
-    /// stream, Software returns the CPU oracle PPM.
+    /// Execute a display list: Metal rasters, Vulkan dispatches the same
+    /// committed SPIR-V pass plan, Software returns the CPU oracle PPM.
     pub fn run_ppm(self, list: &DisplayList) -> Result<Vec<u8>, GpuError> {
         match self {
             Self::Metal => raster_display_ppm(list),
@@ -131,11 +132,10 @@ impl Backend {
                 let pixels = render_cpu_passes(list)?;
                 ppm_bytes(list.width, list.height, &pixels)
             }
-            Self::Vulkan => Err(GpuError::InvalidParameters(
-                "the Vulkan backend is record-only and produces no pixels; \
-                 use VulkanBackend::record/encode"
-                    .to_owned(),
-            )),
+            Self::Vulkan => {
+                let pixels = vulkan_device::execute(list)?;
+                ppm_bytes(list.width, list.height, &pixels)
+            }
         }
     }
 }
@@ -242,6 +242,8 @@ pub enum GpuError {
     InvalidParameters(String),
     InvalidDisplayList(String),
     Metal(String),
+    /// A real Vulkan device could not load, build or execute the pass plan.
+    Vulkan(String),
     Mismatch {
         width: u32,
         height: u32,
@@ -266,6 +268,7 @@ impl fmt::Display for GpuError {
             Self::InvalidParameters(message) => write!(f, "InvalidParameters: {message}"),
             Self::InvalidDisplayList(message) => write!(f, "InvalidDisplayList: {message}"),
             Self::Metal(message) => write!(f, "Metal error: {message}"),
+            Self::Vulkan(message) => write!(f, "Vulkan error: {message}"),
             Self::Mismatch {
                 width,
                 height,

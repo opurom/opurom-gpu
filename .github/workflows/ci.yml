@@ -76,6 +76,14 @@ jobs:
               ;;
             *) ;;
           esac
+      # Optional software Vulkan driver: lavapipe lets the compute execute
+      # tests run headlessly on a GPU-less runner. If apt cannot provide it,
+      # those tests print SKIP and assert no fake success.
+      - name: Install software Vulkan driver
+        if: matrix.check == 'rust-test'
+        run: |
+          (sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers) \
+            || echo "Vulkan driver unavailable; execute tests will SKIP"
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
 

@@ -30,8 +30,8 @@ const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
 const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
-const VK_QUEUE_COMPUTE_BIT: u32 = 0x4;
-const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 1;
+pub(crate) const VK_QUEUE_COMPUTE_BIT: u32 = 0x2;
+pub(crate) const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
 
 /// What the probe found, cached for the process lifetime.
 pub struct VulkanProbe {
@@ -157,7 +157,7 @@ struct PropertiesBuffer {
 /// The 55 core `VkPhysicalDeviceFeatures` booleans, frozen by Vulkan 1.0.
 /// Fields after `shader_int64` are unread padding kept for the real size.
 #[repr(C)]
-struct PhysicalDeviceFeatures {
+pub(crate) struct PhysicalDeviceFeatures {
     robust_buffer_access: u32,
     full_draw_index_uint32: u32,
     image_cube_array: u32,
@@ -198,7 +198,7 @@ struct PhysicalDeviceFeatures {
     shader_clip_distance: u32,
     shader_cull_distance: u32,
     shader_float64: u32,
-    shader_int64: u32,
+    pub(crate) shader_int64: u32,
     remaining: [u32; 14],
 }
 
@@ -235,9 +235,9 @@ type DestroyDeviceFn = unsafe extern "system" fn(*mut c_void, *const c_void);
 
 /// Every entry point the probe needs, resolved through the loader's
 /// `vkGetInstanceProcAddr` (instance functions after instance creation).
-struct VulkanLibrary {
-    _handle: *mut c_void,
-    get_instance_proc_addr: GetInstanceProcAddrFn,
+pub(crate) struct VulkanLibrary {
+    pub(crate) handle: *mut c_void,
+    pub(crate) get_instance_proc_addr: GetInstanceProcAddrFn,
     create_instance: CreateInstanceFn,
 }
 
@@ -258,7 +258,7 @@ impl VulkanLibrary {
     /// dlopen the first loader the host provides. MoltenVK ships the loader
     /// inside its library, so it is a candidate like the .so loader names.
     #[cfg(unix)]
-    fn load() -> Result<Self, &'static str> {
+    pub(crate) fn load() -> Result<Self, &'static str> {
         for name in ["libvulkan.so.1", "libvulkan.so", "libMoltenVK.dylib"] {
             let path = CString::new(name).expect("loader names contain no NUL");
             // SAFETY: dlopen with a valid path; the handle is closed once.
@@ -278,7 +278,7 @@ impl VulkanLibrary {
             let create_instance =
                 unsafe { std::mem::transmute::<*mut c_void, CreateInstanceFn>(entry) };
             return Ok(Self {
-                _handle: handle,
+                handle,
                 get_instance_proc_addr: unsafe {
                     std::mem::transmute::<*mut c_void, GetInstanceProcAddrFn>(entry)
                 },
@@ -294,14 +294,14 @@ impl Drop for VulkanLibrary {
         #[cfg(unix)]
         // SAFETY: the handle came from dlopen and is closed exactly once.
         unsafe {
-            dlclose(self._handle);
+            dlclose(self.handle);
         }
     }
 }
 
 /// Resolve one instance-level entry point, failing the probe if missing.
 #[cfg(unix)]
-fn resolve<T>(
+pub(crate) fn resolve<T>(
     library: &VulkanLibrary,
     instance: *mut c_void,
     name: &str,

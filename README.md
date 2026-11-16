@@ -160,7 +160,7 @@ Text glyph compositing stays CPU-side: glyphs reach
 the GPU only as pre-decomposed solid rectangles; there is no GPU glyph atlas,
 font shaping or full-scene GPU text. The `raster` command is headless; the
 drawable presentation path is described below. There is no dirty-rect
-integration, no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below), no device conformance matrix and no
+integration, no ANGLE/D3D/DirectX backend (Vulkan is probe-gated, see below), no device conformance matrix and no
 fps claim. `dispatch_ms` remains host-side commit-to-completion latency, not an
 fps measurement.
 
@@ -236,7 +236,7 @@ fixture is absent, the test prints a clear `SKIP` message and claims no success.
 
 The `raster` CLI itself is compute-only. Drawable presentation is reached
 through `opurom-platform`; there is still no GPU text
-(glyphs remain CPU-decomposed solid rects), no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below),
+(glyphs remain CPU-decomposed solid rects), no ANGLE/D3D/DirectX backend (Vulkan is probe-gated, see below),
 no device conformance matrix and no fps claim. `dispatch_ms` remains host-side
 commit-to-completion latency. Non-macOS hosts return the documented
 `MetalUnavailable` error and the tests print `SKIP`.
@@ -254,14 +254,26 @@ stream, with integer-only validation and byte-deterministic encoding.
 creates a real `VkInstance`, enumerates physical devices, picks a discrete GPU
 when present, checks the `shaderInt64` feature gate and creates a device with
 one compute queue. `Backend::available()` drives the reported state from that
-probe: a host with a driver reports Vulkan as **record-only** while the SPIR-V
-pixel compute pipeline is pending, and every other host reports
-**unavailable** with the exact reason (no loader, no device, no compute queue,
-missing `shaderInt64`). `backends` prints the probed device name, API/driver
-version and the gate results on a host that has one. The recorded stream is the
-transport contract and stays byte-identical, unchanged by the probe; execution
-is a separate compute raster that lands with the pixel pipeline, so the
-recorded stream is never claimed to be the execution path.
+probe: a host with a usable driver reports Vulkan as **live**, and every other
+host reports **unavailable** with the exact reason (no loader, no device, no
+compute queue, missing `shaderInt64`). `backends` prints the probed device
+name, API/driver version and the gate results on a host that has one.
+
+`src/vulkan_device.rs` is the real execution path: it keeps a probed device,
+enables `shaderInt64`, builds eight compute pipelines from the committed
+SPIR-V blobs (embedded at compile time with `include_bytes!`, no runtime
+shader compilation), uploads the packed display list into host-visible storage
+buffers, dispatches the same ordered pass plan as Metal with a memory barrier
+per pass, and reads back the primary frame. `raster --backend vulkan` writes
+P6 pixels on any host where the probe is live. **The recorded stream is the
+transport contract, not the execution path**: the `VkDraw` triangle/point
+commands describe transport only; execution runs the integer compute raster
+shared with Metal, and the recorded bytes are unchanged by execution.
+A driver arithmetic difference is a real failure the gate exposes, never a
+reason to accept approximate equality: Vulkan must byte-match the CPU oracle
+and the Metal readback, because every kernel is integer-only. The execute gate
+is **CI-verified** on lavapipe (the optional `mesa-vulkan-drivers` apt step);
+on a host with no loader it prints `SKIP` and asserts no fake success.
 
 Typed commands (`VkCommand`), matching the display-list primitives:
 
@@ -310,11 +322,12 @@ typed validation without panics, and honest `Backend` availability.
 Backend selector: `Backend::{Metal, Vulkan, Software}` with
 `Backend::available() -> BackendStatus { availability }`, where
 `BackendAvailability::{Live, RecordOnly, Unavailable}` is honest per host
-(Metal is live only on macOS; Vulkan is record-only; the software oracle is
+(Metal is live only on macOS; Vulkan is live on a probed driver; the software oracle is
 always live). CLI: `opurom-gpu backends` prints the table, `opurom-gpu
 vk-record <commands.json> <out.bin>` writes the encoded command buffer, and
 `opurom-gpu raster --backend software|metal <commands.json> <out.ppm>` selects
-the pixel backend (`--backend vulkan` is refused because it is record-only).
+the pixel backend (`--backend vulkan` executes the committed SPIR-V pass plan
+on a probed Vulkan device and refuses honestly without one).
 
 ## Real drawable presentation
 
@@ -349,7 +362,7 @@ The cross-repo verification command is
 Apple M6 host, the real capture is a 200x182 PNG (200x150 content + 32 px title
 bar) with **0 mismatching pixels of 30 000**, max channel delta 25 and
 `CHANNEL_TOLERANCE=32` / `MISMATCH_BUDGET_PERCENT=2.0`: **PASS**. This is one
-window and one frame, macOS/Metal only. There is no ANGLE/D3D/DirectX backend (Vulkan is record-only, see below),
+window and one frame, macOS/Metal only. There is no ANGLE/D3D/DirectX backend (Vulkan is probe-gated, see below),
 no GPU text shaping, no measured fps claim and no device conformance matrix.
 
 ## Animated multi-frame presentation
@@ -429,8 +442,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **78 tests**
-(42 unit tests and thirty-six integration tests, ten of which are the headless
+that no fake success occurs. On macOS, `cargo test --offline` runs **81 tests**
+(42 unit tests and thirty-nine integration tests, ten of which are the headless
 Vulkan recorder proofs), including the cross-repo `cmp` proofs in
 `tests/display.rs`, `tests/effects.rs` and `tests/software_effects.rs` and the
 Metal/CPU equality proof for a mixed stream containing particles; GPU execution
@@ -449,8 +462,9 @@ software implementations are the explicitly separate CPU parsing/oracle path
 behind `--backend software` and the headless Vulkan command *recorder*, while
 `raster` defaults to the Metal dispatch on macOS and the presentation dylib
 always blits the compute buffer into a real drawable. The Vulkan loader probe
-(`vulkan_loader.rs`) loads a driver at runtime where one exists; recording never
-submits to it, and pixel execution on Vulkan is pending.
+(`vulkan_loader.rs`) loads a driver at runtime where one exists; `raster
+--backend vulkan` executes the committed SPIR-V kernels on that device, while
+`vk-record` only writes the transport stream.
 
 ## API notes
 
