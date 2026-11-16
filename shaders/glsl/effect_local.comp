@@ -1,0 +1,172 @@
+#version 450
+// GLSL port of the MSL `effect_local` kernel: shadow, glow, glass and liquid,
+// pixel for pixel with the MSL integer contract.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer FrameBlock { uint frame[]; };
+layout(set = 0, binding = 1) buffer SecondaryBlock { uint secondary[]; };
+layout(set = 0, binding = 2) buffer BackdropBlock { uint backdrop[]; };
+layout(set = 0, binding = 3) buffer MaskBlock { uint mask[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+const uint COORD_BIAS = 1073741824u;
+
+uvec4 unpack_rgba(uint packed) {
+    return uvec4(packed & 255u, (packed >> 8u) & 255u, (packed >> 16u) & 255u, (packed >> 24u) & 255u);
+}
+
+int64_t dec(uint v) { return int64_t(v) - int64_t(COORD_BIAS); }
+
+uint clamp_u8(int64_t v) {
+    if (v < int64_t(0)) return 0u;
+    if (v > int64_t(255)) return 255u;
+    return uint(v);
+}
+
+// Effect blend: integer half-up (src * a + dst * (255 - a) + 127) / 255.
+uint blend_add(uint s, uint d, int64_t a) {
+    return clamp_u8((int64_t(s) * a + int64_t(d) * (255L - a) + 127L) / 255L);
+}
+
+uvec4 blend_fx(uvec4 dst, uvec3 src, int64_t a) {
+    if (a <= int64_t(0)) return dst;
+    return uvec4(
+        blend_add(src.x, dst.x, a),
+        blend_add(src.y, dst.y, a),
+        blend_add(src.z, dst.z, a),
+        255u
+    );
+}
+
+int64_t alpha_u8(int64_t fixed_alpha) {
+    return int64_t(clamp_u8((fixed_alpha * 255L + 512L) / 1024L));
+}
+
+bool outside_round(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, int64_t x, int64_t y) {
+    if (rad <= int64_t(0)) return false;
+    int64_t cr = rad - 1L;
+    int64_t limit = cr * cr;
+    int64_t dx = x - rx;
+    int64_t cx = (dx < rad) ? (cr - dx) : ((dx >= rw - rad) ? (dx - (rw - rad)) : -1L);
+    int64_t dy = y - ry;
+    int64_t cy = (dy < rad) ? (cr - dy) : ((dy >= rh - rad) ? (dy - (rh - rad)) : -1L);
+    return cx >= int64_t(0) && cy >= int64_t(0) && cx * cx + cy * cy > limit;
+}
+
+bool inside_shape(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, int64_t x, int64_t y) {
+    if (x < rx || y < ry || x >= rx + rw || y >= ry + rh) return false;
+    return !outside_round(rx, ry, rw, rh, rad, x, y);
+}
+
+// Two-pass separable box blur of the hard mask over its local bounds.
+int64_t soft_coverage(uint width, int64_t bx, int64_t by, int64_t bw, int64_t bh, int64_t r, int64_t x, int64_t y) {
+    const int64_t ix = x - bx;
+    const int64_t iy = y - by;
+    if (ix < int64_t(0) || iy < int64_t(0) || ix >= bw || iy >= bh) return int64_t(0);
+    int64_t left = ix - r; if (left < int64_t(0)) left = 0L;
+    int64_t right = ix + r + 1L; if (right > bw) right = bw;
+    int64_t top = iy - r; if (top < int64_t(0)) top = 0L;
+    int64_t bottom = iy + r + 1L; if (bottom > bh) bottom = bh;
+    const int64_t span_x = right - left;
+    const int64_t span_y = bottom - top;
+    if (span_x <= int64_t(0) || span_y <= int64_t(0)) return int64_t(0);
+    int64_t sum_y = 0L;
+    for (int64_t yy = top; yy < bottom; ++yy) {
+        int64_t sum_x = 0L;
+        for (int64_t xx = left; xx < right; ++xx) {
+            sum_x += int64_t(mask[uint((by + yy) * int64_t(width) + (bx + xx))]);
+        }
+        sum_y += (sum_x + span_x / 2L) / span_x;
+    }
+    return int64_t(clamp_u8((sum_y + span_y / 2L) / span_y));
+}
+
+// Two-pass separable box blur of the full backdrop framebuffer at one pixel.
+uvec3 blurred_backdrop(uint width, uint height, int64_t r, int64_t x, int64_t y) {
+    const int64_t w = int64_t(width);
+    const int64_t h = int64_t(height);
+    int64_t left = x - r; if (left < int64_t(0)) left = 0L;
+    int64_t right = x + r + 1L; if (right > w) right = w;
+    int64_t top = y - r; if (top < int64_t(0)) top = 0L;
+    int64_t bottom = y + r + 1L; if (bottom > h) bottom = h;
+    const int64_t span_x = right - left;
+    const int64_t span_y = bottom - top;
+    if (span_x <= int64_t(0) || span_y <= int64_t(0)) return uvec3(0u);
+    uvec3 rgb;
+    for (uint k = 0u; k < 3u; ++k) {
+        int64_t sum_y = 0L;
+        for (int64_t yy = top; yy < bottom; ++yy) {
+            int64_t sum_x = 0L;
+            for (int64_t xx = left; xx < right; ++xx) {
+                sum_x += int64_t((backdrop[uint(yy * w + xx)] >> (8u * k)) & 255u);
+            }
+            sum_y += (sum_x + span_x / 2L) / span_x;
+        }
+        rgb[k] = clamp_u8((sum_y + span_y / 2L) / span_y);
+    }
+    return rgb;
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint width = p[0];
+    const uint height = p[1];
+    const uint count = width * height;
+    if (tid >= count) return;
+    const int64_t w = int64_t(width);
+    const int64_t x = int64_t(tid % width);
+    const int64_t y = int64_t(tid / width);
+    const uvec4 here = uvec4((frame[tid] >> 0u) & 255u, (frame[tid] >> 8u) & 255u,
+                             (frame[tid] >> 16u) & 255u, 255u);
+    const int64_t kind = int64_t(p[2]);
+    const uvec3 color = unpack_rgba(p[3]).xyz;
+    const int64_t base = alpha_u8(int64_t(p[7]));
+    const int64_t r = int64_t(p[8]);
+    const int64_t dx = dec(p[9]);
+    const int64_t dy = dec(p[10]);
+    const int64_t rad = int64_t(p[11]);
+    const int64_t denom = int64_t(p[12]);
+    const int64_t bx = dec(p[13]), by = dec(p[14]), bw = dec(p[15]), bh = dec(p[16]);
+    const int64_t rx = dec(p[17]), ry = dec(p[18]), rw = dec(p[19]), rh = dec(p[20]);
+    const int64_t cx = dec(p[21]), cy = dec(p[22]), cw = dec(p[23]), ch = dec(p[24]);
+    uvec4 out_color = here;
+
+    if (kind == 0L || kind == 1L) {
+        const int64_t ix = x - bx;
+        const int64_t iy = y - by;
+        if (ix >= int64_t(0) && iy >= int64_t(0) && ix < bw && iy < bh) {
+            const int64_t mi = (by + iy) * w + (bx + ix);
+            if (mask[uint(mi)] == 0u) {
+                const int64_t sx = (kind == 0L) ? (x - dx) : x;
+                const int64_t sy = (kind == 0L) ? (y - dy) : y;
+                const int64_t cov = soft_coverage(width, bx, by, bw, bh, r, sx, sy);
+                int64_t a = (base * cov + 127L) / 255L;
+                if (a > 255L) a = 255L;
+                out_color = blend_fx(here, color, a);
+            }
+        }
+    } else if (kind == 2L) {
+        if (x >= cx && y >= cy && x < cx + cw && y < cy + ch &&
+            inside_shape(rx, ry, rw, rh, rad, x, y)) {
+            const uvec3 blurred = blurred_backdrop(width, height, r, x, y);
+            out_color = blend_fx(uvec4(blurred, 255u), color, base);
+        }
+    } else if (kind == 3L) {
+        if (x >= cx && y >= cy && x < cx + cw && y < cy + ch &&
+            inside_shape(rx, ry, rw, rh, rad, x, y)) {
+            const int64_t d = (x - rx) + (y - ry);
+            int64_t t = (d * 1024L) / denom;
+            if (t < int64_t(0)) t = 0L;
+            if (t > 1024L) t = 1024L;
+            int64_t delta = 3L * t - 1024L;
+            if (delta < int64_t(0)) delta = -delta;
+            int64_t band = 1024L - delta;
+            if (band < int64_t(0)) band = 0L;
+            int64_t a = (base * band + 512L) / 1024L;
+            if (a > 255L) a = 255L;
+            out_color = blend_fx(here, color, a);
+        }
+    }
+    secondary[tid] = out_color.x | (out_color.y << 8u) | (out_color.z << 16u) | (out_color.w << 24u);
+}

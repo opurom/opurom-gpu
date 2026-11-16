@@ -1,0 +1,15 @@
+#version 450
+// GLSL port of the MSL `snapshot_frame` kernel: copy the current frame into
+// the backdrop buffer for the effect pass that follows.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer FrameBlock { uint frame[]; };
+layout(set = 0, binding = 2) buffer BackdropBlock { uint backdrop[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint count = p[0] * p[1];
+    if (tid >= count) return;
+    backdrop[tid] = frame[tid];
+}

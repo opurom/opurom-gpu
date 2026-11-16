@@ -1,0 +1,41 @@
+#version 450
+// GLSL port of the MSL `gaussian_horizontal` kernel: one half of the
+// separable binomial (discrete-Gaussian) convolution, clamped edges and
+// (sum + W/2)/W half-up rounding, weights packed in the push constants.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer SourceBlock { uint src[]; };
+layout(set = 0, binding = 1) buffer TargetBlock { uint dst[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+uint clamp_u8(int64_t v) {
+    if (v < int64_t(0)) return 0u;
+    if (v > int64_t(255)) return 255u;
+    return uint(v);
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint width = p[0];
+    const uint height = p[1];
+    const uint count = width * height;
+    if (tid >= count) return;
+    const int64_t r = int64_t(p[2]);
+    const int64_t weight_sum = int64_t(p[3]);
+    const int64_t w = int64_t(width);
+    const int64_t x = int64_t(tid % width);
+    const int64_t y = int64_t(tid / width);
+    uint packed = 0u;
+    for (uint k = 0u; k < 4u; ++k) {
+        int64_t sum = 0L;
+        for (int64_t j = 0L; j <= 2L * r; ++j) {
+            int64_t sx = x + j - r;
+            if (sx < int64_t(0)) sx = 0L;
+            if (sx >= w) sx = w - 1L;
+            sum += int64_t((src[uint(y * w + sx)] >> (8u * k)) & 255u) * int64_t(p[4u + uint(j)]);
+        }
+        packed |= clamp_u8((sum + weight_sum / 2L) / weight_sum) << (8u * k);
+    }
+    dst[tid] = packed;
+}

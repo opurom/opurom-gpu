@@ -1,0 +1,55 @@
+#version 450
+// GLSL port of the MSL `build_mask` kernel: node silhouette by shape test, or
+// the frame/backdrop diff, one byte per pixel.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer FrameBlock { uint frame[]; };
+layout(set = 0, binding = 2) buffer BackdropBlock { uint backdrop[]; };
+layout(set = 0, binding = 3) buffer MaskBlock { uint mask[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+const uint COORD_BIAS = 1073741824u;
+
+int64_t dec(uint v) { return int64_t(v) - int64_t(COORD_BIAS); }
+
+bool outside_round(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, int64_t x, int64_t y) {
+    if (rad <= int64_t(0)) return false;
+    int64_t cr = rad - 1L;
+    int64_t limit = cr * cr;
+    int64_t dx = x - rx;
+    int64_t cx = (dx < rad) ? (cr - dx) : ((dx >= rw - rad) ? (dx - (rw - rad)) : -1L);
+    int64_t dy = y - ry;
+    int64_t cy = (dy < rad) ? (cr - dy) : ((dy >= rh - rad) ? (dy - (rh - rad)) : -1L);
+    return cx >= int64_t(0) && cy >= int64_t(0) && cx * cx + cy * cy > limit;
+}
+
+bool inside_shape(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, int64_t x, int64_t y) {
+    if (x < rx || y < ry || x >= rx + rw || y >= ry + rh) return false;
+    return !outside_round(rx, ry, rw, rh, rad, x, y);
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint width = p[0];
+    const uint height = p[1];
+    const uint count = width * height;
+    if (tid >= count) return;
+    const int64_t x = int64_t(tid % width);
+    const int64_t y = int64_t(tid / width);
+    const int64_t rad = int64_t(p[11]);
+    const int64_t bx = dec(p[13]), by = dec(p[14]), bw = dec(p[15]), bh = dec(p[16]);
+    const int64_t rx = dec(p[17]), ry = dec(p[18]), rw = dec(p[19]), rh = dec(p[20]);
+    const int64_t cx = dec(p[21]), cy = dec(p[22]), cw = dec(p[23]), ch = dec(p[24]);
+    const bool shape = p[25] != 0u;
+    uint v = 0u;
+    if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
+        x >= cx && y >= cy && x < cx + cw && y < cy + ch) {
+        if (shape) {
+            if (inside_shape(rx, ry, rw, rh, rad, x, y)) v = 255u;
+        } else {
+            if (frame[tid] != backdrop[tid]) v = 255u;
+        }
+    }
+    mask[tid] = v;
+}

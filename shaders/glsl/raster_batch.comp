@@ -1,0 +1,141 @@
+#version 450
+// GLSL port of the MSL `raster_batch` kernel: one thread per viewport pixel,
+// regular commands blended in list order over the packed RGBA8 frame.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer FrameBlock { uint frame[]; };
+layout(set = 0, binding = 4) buffer CommandsBlock { uint commands[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+const uint COORD_BIAS = 1073741824u;
+const uint COMMAND_WORDS = 16u;
+const uint KIND_SOLID = 0u;
+const uint KIND_ROUNDED = 1u;
+const uint KIND_GRADIENT = 2u;
+const uint KIND_GRADIENT_H = 3u;
+const uint KIND_PARTICLES = 4u;
+
+uvec4 unpack_rgba(uint packed) {
+    return uvec4(packed & 255u, (packed >> 8u) & 255u, (packed >> 16u) & 255u, (packed >> 24u) & 255u);
+}
+
+uint pack_rgba(uvec4 c) {
+    return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
+}
+
+int64_t dec(uint v) { return int64_t(v) - int64_t(COORD_BIAS); }
+
+// Integer avalanche mix: pure in (seed, dot index), so no particle positions
+// need to be uploaded and every host computes the same centres.
+uint particle_mix(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15u;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+uint clamp_u8(int64_t v) {
+    if (v < int64_t(0)) return 0u;
+    if (v > int64_t(255)) return 255u;
+    return uint(v);
+}
+
+int64_t mix_channel(uint from, uint to, int64_t t) {
+    int64_t value = ((int64_t(to) - int64_t(from)) * t + 512L) / 1024L + int64_t(from);
+    return int64_t(clamp_u8(value));
+}
+
+bool outside_round(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, int64_t x, int64_t y) {
+    if (rad <= int64_t(0)) return false;
+    int64_t cr = rad - 1L;
+    int64_t limit = cr * cr;
+    int64_t dx = x - rx;
+    int64_t cx = (dx < rad) ? (cr - dx) : ((dx >= rw - rad) ? (dx - (rw - rad)) : -1L);
+    int64_t dy = y - ry;
+    int64_t cy = (dy < rad) ? (cr - dy) : ((dy >= rh - rad) ? (dy - (rh - rad)) : -1L);
+    return cx >= int64_t(0) && cy >= int64_t(0) && cx * cx + cy * cy > limit;
+}
+
+// Regular-command blend: integer /255 without half-up rounding.
+uvec4 blend_px(uvec4 dst, uvec4 src) {
+    if (src.w == 0u) return dst;
+    if (src.w == 255u) return src;
+    uint a = src.w;
+    uint inv = 255u - a;
+    return uvec4(
+        (src.x * a + dst.x * inv) / 255u,
+        (src.y * a + dst.y * inv) / 255u,
+        (src.z * a + dst.z * inv) / 255u,
+        255u
+    );
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint width = p[0];
+    const uint height = p[1];
+    const uint count = width * height;
+    if (tid >= count) return;
+    const uint first = p[5];
+    const uint command_count = p[6];
+    uvec4 color = unpack_rgba(p[4]);
+    if (p[2] == 0u) color = unpack_rgba(frame[tid]);
+    const int64_t px = int64_t(tid % width);
+    const int64_t py = int64_t(tid / width);
+
+    for (uint ci = 0u; ci < command_count; ++ci) {
+        const uint base = first + ci * COMMAND_WORDS;
+        const uint kind = commands[base];
+        const int64_t rx = dec(commands[base + 1u]);
+        const int64_t ry = dec(commands[base + 2u]);
+        const int64_t rw = dec(commands[base + 3u]);
+        const int64_t rh = dec(commands[base + 4u]);
+        const int64_t clipx = dec(commands[base + 5u]);
+        const int64_t clipy = dec(commands[base + 6u]);
+        const int64_t clipw = dec(commands[base + 7u]);
+        const int64_t cliph = dec(commands[base + 8u]);
+        const int64_t rad = dec(commands[base + 9u]);
+
+        if (px < rx || py < ry || px >= rx + rw || py >= ry + rh) continue;
+        if (px < clipx || py < clipy || px >= clipx + clipw || py >= clipy + cliph) continue;
+        if (rad > int64_t(0) && outside_round(rx, ry, rw, rh, rad, px, py)) continue;
+
+        if (kind == KIND_GRADIENT || kind == KIND_GRADIENT_H) {
+            const bool horizontal = kind == KIND_GRADIENT_H;
+            const int64_t last = (horizontal ? rw : rh) - 1L;
+            const int64_t local = horizontal ? (px - rx) : (py - ry);
+            const int64_t t = (last <= 0L) ? 1024L : (local * 1024L) / last;
+            const uvec4 top = unpack_rgba(commands[base + 10u]);
+            const uvec4 bottom = unpack_rgba(commands[base + 11u]);
+            const uint alpha = commands[base + 12u];
+            const uvec4 src = uvec4(
+                mix_channel(top.x, bottom.x, t),
+                mix_channel(top.y, bottom.y, t),
+                mix_channel(top.z, bottom.z, t),
+                alpha
+            );
+            color = blend_px(color, src);
+        } else if (kind == KIND_PARTICLES) {
+            const uvec4 dot = unpack_rgba(commands[base + 10u]);
+            const uint pcount = commands[base + 11u];
+            const uint pseed = commands[base + 12u];
+            const int64_t prad = int64_t(commands[base + 13u]);
+            const int64_t limit = prad * prad;
+            for (uint i = 0u; i < pcount; ++i) {
+                const uint hx = particle_mix(pseed ^ (i * 0x9E3779B9u + 0x6C078965u));
+                const uint hy = particle_mix(pseed ^ (i * 0x9E3779B9u + 0x85EBCA6Bu));
+                const int64_t cx = rx + int64_t(hx % uint(rw));
+                const int64_t cy = ry + int64_t(hy % uint(rh));
+                const int64_t dx = px - cx;
+                const int64_t dy = py - cy;
+                if (dx * dx + dy * dy <= limit) color = blend_px(color, dot);
+            }
+        } else if (kind == KIND_SOLID || kind == KIND_ROUNDED) {
+            color = blend_px(color, unpack_rgba(commands[base + 10u]));
+        }
+    }
+    frame[tid] = pack_rgba(color);
+}

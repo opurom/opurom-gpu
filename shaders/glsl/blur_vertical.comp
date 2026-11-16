@@ -1,0 +1,40 @@
+#version 450
+// GLSL port of the MSL `blur_vertical` kernel: the vertical box-blur half,
+// reading the horizontal pass output and writing the current frame back.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer SourceBlock { uint src[]; };
+layout(set = 0, binding = 1) buffer TargetBlock { uint dst[]; };
+layout(push_constant) uniform Params { uint p[28]; };
+
+uint clamp_u8(int64_t v) {
+    if (v < int64_t(0)) return 0u;
+    if (v > int64_t(255)) return 255u;
+    return uint(v);
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint width = p[0];
+    const uint height = p[1];
+    const uint count = width * height;
+    if (tid >= count) return;
+    const int64_t r = int64_t(p[2]);
+    const int64_t w = int64_t(width);
+    const int64_t h = int64_t(height);
+    const int64_t x = int64_t(tid % width);
+    const int64_t y = int64_t(tid / width);
+    int64_t top = y - r; if (top < int64_t(0)) top = 0L;
+    int64_t bottom = y + r + 1L; if (bottom > h) bottom = h;
+    const int64_t span = bottom - top;
+    uint packed = 0u;
+    for (uint k = 0u; k < 4u; ++k) {
+        int64_t sum = 0L;
+        for (int64_t yy = top; yy < bottom; ++yy) {
+            sum += int64_t((src[uint(yy * w + x)] >> (8u * k)) & 255u);
+        }
+        packed |= clamp_u8((sum + span / 2L) / span) << (8u * k);
+    }
+    dst[tid] = packed;
+}
