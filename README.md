@@ -6,8 +6,8 @@ gradient, reads the buffer back, and compares its bytes against an independent
 CPU reference. It also **executes the exact display list dumped by
 `opurom-render --commands`** with a Metal compute kernel and writes a P6 PPM
 that is byte-identical to the independent software renderer. Real MSL
-compute kernels cover the five visual effects (blur, shadow, glow, glass,
-liquid), with a second cross-repo byte-equality proof for effect IR. The
+compute kernels cover the six visual effects (blur, Gaussian blur, shadow,
+glow, glass, liquid), with a second cross-repo byte-equality proof for effect IR. The
 presentation path keeps
 the compute output buffer on the GPU and presents it into a live AppKit
 `CAMetalLayer` drawable through a runtime-loaded C ABI. This folder is its own
@@ -145,11 +145,14 @@ cmp cpu.ppm gpu.ppm   # exit 0
 ../opurom-render/target/debug/opurom-render \
   ../opurom-examples/golden/counter.opuir.json 320 240 cpu.ppm --commands counter.commands.json
 ./target/debug/opurom-gpu raster counter.commands.json gpu.ppm
-cmp cpu.ppm gpu.ppm   # exit 0, PPM digest 2d4f92cb70b30ab4
+cmp cpu.ppm gpu.ppm   # exit 0, PPM digest 2c07c7ca0acd9af9
 ```
 
 That comparison is a real GPU/software proof between two independent
-repositories, not a self-comparison against the same code. If the sibling
+repositories, not a self-comparison against the same code. Digests in that
+block are FNV-1a 64 over the PPM bytes as printed by the `PROOF` lines of
+`cargo test --offline --test display -- --nocapture` (counter: 230415 bytes,
+`2c07c7ca0acd9af9`). If the sibling
 renderer binary is absent, the test prints a clear `SKIP` message and does not
 claim success.
 
@@ -214,14 +217,16 @@ The committed effect fixture is
 ```sh
 ../opurom-render/target/debug/opurom-render \
   ../opurom-render/tests/fixtures/effects.opuir.json 96 64 cpu.ppm \
-  --commands fx.commands.json      # digest=ab00722ca3ae679a, dirty=1
+  --commands fx.commands.json      # digest=feb2eaaf6ae4d2ef, dirty=1
 ./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
 ```
 
-Measured result: `cmp` exits 0, both PPMs are 18445 bytes, and the FNV-1a 64
-digest of the PPM bytes is `292043461093fcd5`. The same test also proves
-equality at `64 48` (9229 bytes, PPM digest `51ba485cdab48339`). This is a real
+Measured result (FNV-1a 64 of the PPM bytes, from the `PROOF` lines of
+`cargo test --offline --test effects -- --nocapture`): `cmp` exits 0, both PPMs
+are 18445 bytes, digest `1dc0303be6e1b8b2`. The same test also proves equality
+at `64 48` (9229 bytes, digest `6a6dcd0a237116bb`), and `tests/software_effects.rs`
+reports the same two digests for `raster --backend software`. This is a real
 comparison against the independent software renderer, not a self-comparison.
 If the sibling renderer binary or fixture is absent, the test prints a clear
 `SKIP` message and claims no success.
@@ -410,17 +415,17 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **72 tests**
-(42 unit tests and thirty integration tests, ten of which are the headless Vulkan
-recorder proofs), including the cross-repo `cmp`
-proofs in `tests/display.rs` and `tests/effects.rs` and the Metal/CPU equality
-proof for a mixed stream containing particles; GPU execution cannot be
-validated by Linux CI.
+that no fake success occurs. On macOS, `cargo test --offline` runs **76 tests**
+(42 unit tests and thirty-four integration tests, ten of which are the headless
+Vulkan recorder proofs), including the cross-repo `cmp` proofs in
+`tests/display.rs`, `tests/effects.rs` and `tests/software_effects.rs` and the
+Metal/CPU equality proof for a mixed stream containing particles; GPU execution
+cannot be validated by Linux CI.
 
 ## Backend scope
 
 This backend is display-list work over rects, deterministic particle fields and
-five framebuffer effect kernels, with
+six framebuffer effect kernels, with
 one real Metal drawable presentation path for one live AppKit window. Glyph
 shapes reach the GPU as CPU-decomposed rectangles, and the system default Metal device is the
 one queried. The dispatch path, the readback equality proof and the on-screen presentation
