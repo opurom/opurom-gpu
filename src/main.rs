@@ -7,8 +7,7 @@
 use std::{env, fs, process};
 
 use opurom_gpu::{
-    encode_stream, parse_display_list, probe_output, raster_json_ppm, self_test_output, Backend,
-    BackendAvailability,
+    encode_stream, parse_display_list, probe_output, self_test_output, Backend, BackendAvailability,
 };
 
 const USAGE: &str = "Usage: opurom-gpu <probe|self-test|backends> | \
@@ -70,13 +69,12 @@ fn raster(backend: Backend, commands: &str, out: &str) -> Result<(), String> {
     }
     let json = fs::read_to_string(commands)
         .map_err(|e| format!("cannot read display list {commands:?}: {e}"))?;
-    let ppm = match backend {
-        Backend::Software => {
-            let list = parse_display_list(&json).map_err(|e| e.to_string())?;
-            backend.run_ppm(&list).map_err(|e| e.to_string())?
-        }
-        _ => raster_json_ppm(&json).map_err(|e| e.to_string())?,
-    };
+    // Every pixel backend executes the parsed list through Backend::run_ppm:
+    // Metal, Vulkan and the software oracle share this route. The old
+    // catch-all called raster_json_ppm, which is Metal-only and failed on
+    // Vulkan hosts without Metal.
+    let list = parse_display_list(&json).map_err(|e| e.to_string())?;
+    let ppm = backend.run_ppm(&list).map_err(|e| e.to_string())?;
     fs::write(out, ppm).map_err(|e| format!("cannot write {out:?}: {e}"))
 }
 
