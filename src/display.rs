@@ -2,8 +2,9 @@
 //! effect commands.
 //!
 //! This module never substitutes for Metal. `raster` returns MetalUnavailable
-//! off macOS; the CPU interpreter below covers regular commands only and is for
-//! parser/kernel unit tests, not the cross-repo equality proof.
+//! off macOS; `render_cpu_commands` is the regular-command unit oracle, while
+//! `render_cpu_passes` mirrors the full ordered pass plan so the software
+//! backend executes every effect pass with the MSL kernels' integer arithmetic.
 
 use crate::{GpuError, MAX_DIMENSION};
 use std::str;
@@ -591,7 +592,8 @@ fn blend(pixel: &mut [u8], src: [u8; 4]) {
 }
 
 /// Pure-Rust unit oracle for regular commands only. Effect commands are
-/// executed by Metal; the real `raster` never calls this on a non-Metal host.
+/// ignored here; `render_cpu_passes` is the full display-list oracle that the
+/// software backend executes.
 pub fn render_cpu_commands(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
     let byte_count = crate::display_byte_count(list.width, list.height)?;
     list.validate()?;
@@ -613,6 +615,400 @@ pub fn render_cpu_commands(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
         }
     }
     Ok(pixels)
+}
+
+fn clamp_u8(value: i64) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+/// Effect blend: integer half-up `(src * a + dst * (255 - a) + 127) / 255`,
+/// the `blend_fx` contract shared by the MSL kernel and this path.
+fn blend_fx(dst: [u8; 3], src: [u8; 3], alpha: i64) -> [u8; 3] {
+    if alpha <= 0 {
+        return dst;
+    }
+    let mut out = [0u8; 3];
+    for channel in 0..3 {
+        let value =
+            (i64::from(src[channel]) * alpha + i64::from(dst[channel]) * (255 - alpha) + 127) / 255;
+        out[channel] = clamp_u8(value);
+    }
+    out
+}
+
+/// Fixed-point effect alpha reduced to a byte, as `alpha_u8` does in MSL.
+fn effect_alpha(fixed: i64) -> i64 {
+    i64::from(clamp_u8((fixed * 255 + 512) / 1024))
+}
+
+/// Rect containment plus rounded-corner rejection, as `inside_shape` in MSL.
+fn inside_shape(rect: [i64; 4], radius: i64, x: i64, y: i64) -> bool {
+    x >= rect[0]
+        && y >= rect[1]
+        && x < rect[0] + rect[2]
+        && y < rect[1] + rect[3]
+        && !outside_round(rect, radius, x, y)
+}
+
+/// Two-pass box blur of the hard mask over its local bounds: the byte
+/// coverage `effect_local` uses for shadows and glows.
+fn soft_coverage(mask: &[u8], width: u32, bounds: [i64; 4], radius: i64, x: i64, y: i64) -> i64 {
+    let (bx, by, bw, bh) = (bounds[0], bounds[1], bounds[2], bounds[3]);
+    let (ix, iy) = (x - bx, y - by);
+    if ix < 0 || iy < 0 || ix >= bw || iy >= bh {
+        return 0;
+    }
+    let left = (ix - radius).max(0);
+    let right = (ix + radius + 1).min(bw);
+    let top = (iy - radius).max(0);
+    let bottom = (iy + radius + 1).min(bh);
+    let (span_x, span_y) = (right - left, bottom - top);
+    if span_x <= 0 || span_y <= 0 {
+        return 0;
+    }
+    let width = i64::from(width);
+    let mut sum_y = 0i64;
+    for yy in top..bottom {
+        let mut sum_x = 0i64;
+        for xx in left..right {
+            sum_x += i64::from(mask[((by + yy) * width + (bx + xx)) as usize]);
+        }
+        sum_y += (sum_x + span_x / 2) / span_x;
+    }
+    i64::from(clamp_u8((sum_y + span_y / 2) / span_y))
+}
+
+/// Two-pass box blur of the backdrop framebuffer at one pixel, mirroring
+/// `blurred_backdrop` in MSL for the glass effect.
+fn blurred_backdrop(src: &[u8], width: u32, height: u32, radius: i64, x: i64, y: i64) -> [u8; 3] {
+    let (w, h) = (i64::from(width), i64::from(height));
+    let left = (x - radius).max(0);
+    let right = (x + radius + 1).min(w);
+    let top = (y - radius).max(0);
+    let bottom = (y + radius + 1).min(h);
+    let (span_x, span_y) = (right - left, bottom - top);
+    if span_x <= 0 || span_y <= 0 {
+        return [0, 0, 0];
+    }
+    let mut rgb = [0u8; 3];
+    for channel in 0..3usize {
+        let mut sum_y = 0i64;
+        for yy in top..bottom {
+            let mut sum_x = 0i64;
+            for xx in left..right {
+                sum_x += i64::from(src[((yy * w + xx) * 4 + channel as i64) as usize]);
+            }
+            sum_y += (sum_x + span_x / 2) / span_x;
+        }
+        rgb[channel] = clamp_u8((sum_y + span_y / 2) / span_y);
+    }
+    rgb
+}
+
+/// The `build_mask` pass: node silhouette (shape) or frame/backdrop diff,
+/// written for every pixel of the viewport.
+fn build_mask(
+    frame: &[u8],
+    backdrop: &[u8],
+    mask: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: [i64; 4],
+    clip: [i64; 4],
+    bounds: [i64; 4],
+    shape_radius: i64,
+    shape: bool,
+) {
+    let (w, h) = (i64::from(width), i64::from(height));
+    for y in 0..h {
+        for x in 0..w {
+            let mut value = 0u8;
+            if x >= bounds[0]
+                && y >= bounds[1]
+                && x < bounds[0] + bounds[2]
+                && y < bounds[1] + bounds[3]
+                && x >= clip[0]
+                && y >= clip[1]
+                && x < clip[0] + clip[2]
+                && y < clip[1] + clip[3]
+            {
+                if shape {
+                    if inside_shape(rect, shape_radius, x, y) {
+                        value = 255;
+                    }
+                } else {
+                    let offset = ((y * w + x) * 4) as usize;
+                    if frame[offset..offset + 4] != backdrop[offset..offset + 4] {
+                        value = 255;
+                    }
+                }
+            }
+            mask[(y * w + x) as usize] = value;
+        }
+    }
+}
+
+/// The `effect_local` pass: shadow, glow, glass and liquid, pixel for pixel
+/// with the MSL kernel, including its unconditional alpha-255 write.
+fn effect_local(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    backdrop: &[u8],
+    mask: &[u8],
+    command: &Command,
+) {
+    let (kind, color, base, radius, dx, dy, shape_radius, denom, bounds, rect, clip) =
+        match *command {
+            Command::EffectShadow {
+                bounds,
+                radius,
+                dx,
+                dy,
+                alpha,
+                color,
+            } => (
+                0,
+                color,
+                effect_alpha(alpha),
+                radius,
+                dx,
+                dy,
+                0,
+                1,
+                bounds,
+                [0; 4],
+                [0; 4],
+            ),
+            Command::EffectGlow {
+                bounds,
+                radius,
+                alpha,
+                color,
+            } => (
+                1,
+                color,
+                effect_alpha(alpha),
+                radius,
+                0,
+                0,
+                0,
+                1,
+                bounds,
+                [0; 4],
+                [0; 4],
+            ),
+            Command::EffectGlass {
+                rect,
+                clip,
+                bounds,
+                shape_radius,
+                radius,
+                alpha,
+                color,
+            } => (
+                2,
+                color,
+                effect_alpha(alpha),
+                radius,
+                0,
+                0,
+                shape_radius,
+                1,
+                bounds,
+                rect,
+                clip,
+            ),
+            Command::EffectLiquid {
+                rect,
+                clip,
+                bounds,
+                shape_radius,
+                denom,
+                alpha,
+                color,
+            } => (
+                3,
+                color,
+                effect_alpha(alpha),
+                0,
+                0,
+                0,
+                shape_radius,
+                denom,
+                bounds,
+                rect,
+                clip,
+            ),
+            _ => return,
+        };
+    let (w, h) = (i64::from(width), i64::from(height));
+    let color = [color[0], color[1], color[2]];
+    for y in 0..h {
+        for x in 0..w {
+            let offset = ((y * w + x) * 4) as usize;
+            let here = [frame[offset], frame[offset + 1], frame[offset + 2]];
+            let mut out = here;
+            if kind <= 1 {
+                let (ix, iy) = (x - bounds[0], y - bounds[1]);
+                if ix >= 0
+                    && iy >= 0
+                    && ix < bounds[2]
+                    && iy < bounds[3]
+                    && mask[(y * w + x) as usize] == 0
+                {
+                    let (sample_x, sample_y) = if kind == 0 { (x - dx, y - dy) } else { (x, y) };
+                    let coverage = soft_coverage(mask, width, bounds, radius, sample_x, sample_y);
+                    let mut alpha = (base * coverage + 127) / 255;
+                    if alpha > 255 {
+                        alpha = 255;
+                    }
+                    out = blend_fx(here, color, alpha);
+                }
+            } else if x >= clip[0]
+                && y >= clip[1]
+                && x < clip[0] + clip[2]
+                && y < clip[1] + clip[3]
+                && inside_shape(rect, shape_radius, x, y)
+            {
+                if kind == 2 {
+                    out = blend_fx(
+                        blurred_backdrop(backdrop, width, height, radius, x, y),
+                        color,
+                        base,
+                    );
+                } else {
+                    let diagonal = (x - rect[0]) + (y - rect[1]);
+                    let mut t = (diagonal * 1024) / denom;
+                    if t < 0 {
+                        t = 0;
+                    }
+                    if t > 1024 {
+                        t = 1024;
+                    }
+                    let mut delta = 3 * t - 1024;
+                    if delta < 0 {
+                        delta = -delta;
+                    }
+                    let band = (1024 - delta).max(0);
+                    let mut alpha = (base * band + 512) / 1024;
+                    if alpha > 255 {
+                        alpha = 255;
+                    }
+                    out = blend_fx(here, color, alpha);
+                }
+            }
+            frame[offset] = out[0];
+            frame[offset + 1] = out[1];
+            frame[offset + 2] = out[2];
+            frame[offset + 3] = 255;
+        }
+    }
+}
+
+/// One separable box-blur pass over the whole frame: the horizontal or the
+/// vertical half of the `effect_blur` pair.
+fn blur_axis(frame: &[u8], width: u32, height: u32, radius: i64, horizontal: bool) -> Vec<u8> {
+    let (w, h) = (i64::from(width), i64::from(height));
+    let mut out = vec![0u8; frame.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (start, end) = if horizontal {
+                ((x - radius).max(0), (x + radius + 1).min(w))
+            } else {
+                ((y - radius).max(0), (y + radius + 1).min(h))
+            };
+            let span = end - start;
+            let offset = ((y * w + x) * 4) as usize;
+            for channel in 0..4usize {
+                let mut sum = 0i64;
+                for step in start..end {
+                    let index = if horizontal {
+                        ((y * w + step) * 4) as usize + channel
+                    } else {
+                        ((step * w + x) * 4) as usize + channel
+                    };
+                    sum += i64::from(frame[index]);
+                }
+                out[offset + channel] = clamp_u8((sum + span / 2) / span);
+            }
+        }
+    }
+    out
+}
+
+/// Full display-list oracle behind `Backend::Software`: regular commands
+/// blend in list order, then every effect pass runs with the same integer
+/// arithmetic as its MSL kernel, so one display list produces the same bytes
+/// on every backend. The backdrop starts zeroed, like a fresh GPU buffer.
+pub fn render_cpu_passes(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
+    let byte_count = crate::display_byte_count(list.width, list.height)?;
+    list.validate()?;
+    let mut frame = Vec::with_capacity(byte_count);
+    for _ in 0..(u64::from(list.width) * u64::from(list.height)) {
+        frame.extend_from_slice(&[
+            list.background[0],
+            list.background[1],
+            list.background[2],
+            255,
+        ]);
+    }
+    let mut backdrop = vec![0u8; byte_count];
+    let mut mask = vec![0u8; frame.len() / 4];
+    for command in &list.commands {
+        match *command {
+            Command::EffectBackdrop => backdrop.copy_from_slice(&frame),
+            Command::EffectMask {
+                rect,
+                clip,
+                bounds,
+                shape_radius,
+                shape,
+            } => build_mask(
+                &frame,
+                &backdrop,
+                &mut mask,
+                list.width,
+                list.height,
+                rect,
+                clip,
+                bounds,
+                shape_radius,
+                shape,
+            ),
+            Command::EffectShadow { .. }
+            | Command::EffectGlow { .. }
+            | Command::EffectGlass { .. }
+            | Command::EffectLiquid { .. } => effect_local(
+                &mut frame,
+                list.width,
+                list.height,
+                &backdrop,
+                &mask,
+                command,
+            ),
+            Command::EffectBlur { radius } => {
+                let horizontal = blur_axis(&frame, list.width, list.height, radius, true);
+                frame = blur_axis(&horizontal, list.width, list.height, radius, false);
+            }
+            Command::EffectGaussianBlur { radius } => {
+                frame = gaussian_blur_cpu(&frame, list.width, list.height, radius)?
+            }
+            _ => {
+                for y in 0..list.height {
+                    for x in 0..list.width {
+                        let offset = (y as usize * list.width as usize + x as usize) * 4;
+                        command.blend_at(
+                            &mut frame[offset..offset + 4],
+                            i64::from(x),
+                            i64::from(y),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(frame)
 }
 
 /// Binomial row `C(2r, 0..=2r)`: an integer, deterministic discrete-Gaussian

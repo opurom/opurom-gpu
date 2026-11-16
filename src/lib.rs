@@ -2,6 +2,9 @@
 //!
 //! The CPU reference and the MSL kernel share an integer pixel contract. Metal
 //! code is compiled only on macOS; other targets return `MetalUnavailable`.
+//! The software backend runs the same ordered pass plan on the CPU, so
+//! `--backend software` writes the bytes Metal reads back, effect passes
+//! included.
 //!
 //! `raster <commands.json> <out.ppm>` uploads the independent renderer's exact
 //! display list to Metal compute kernels. Six effect command types are
@@ -22,11 +25,11 @@ mod reference;
 pub mod vulkan;
 
 pub use display::{
-    gaussian_blur_cpu, parse_display_list, render_cpu_commands, Command, DisplayList, Pass,
-    COMMAND_WORDS, COORD_BIAS, GAUSSIAN_MAX_RADIUS, GAUSSIAN_MIN_RADIUS, KERNEL_BATCH,
-    KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_GAUSSIAN_H, KERNEL_GAUSSIAN_V, KERNEL_MASK,
-    KERNEL_SNAPSHOT, MAX_COMMANDS as MAX_DISPLAY_COMMANDS, PARAM_WORDS, PARTICLE_MAX_COUNT,
-    PARTICLE_MAX_RADIUS, PARTICLE_MAX_SEED,
+    gaussian_blur_cpu, parse_display_list, render_cpu_commands, render_cpu_passes, Command,
+    DisplayList, Pass, COMMAND_WORDS, COORD_BIAS, GAUSSIAN_MAX_RADIUS, GAUSSIAN_MIN_RADIUS,
+    KERNEL_BATCH, KERNEL_BLUR_H, KERNEL_BLUR_V, KERNEL_EFFECT, KERNEL_GAUSSIAN_H,
+    KERNEL_GAUSSIAN_V, KERNEL_MASK, KERNEL_SNAPSHOT, MAX_COMMANDS as MAX_DISPLAY_COMMANDS,
+    PARAM_WORDS, PARTICLE_MAX_COUNT, PARTICLE_MAX_RADIUS, PARTICLE_MAX_SEED,
 };
 pub use reference::{render_cpu, Rgb};
 pub use vulkan::{
@@ -116,7 +119,7 @@ impl Backend {
         match self {
             Self::Metal => raster_display_ppm(list),
             Self::Software => {
-                let pixels = render_cpu_commands(list)?;
+                let pixels = render_cpu_passes(list)?;
                 ppm_bytes(list.width, list.height, &pixels)
             }
             Self::Vulkan => Err(GpuError::InvalidParameters(

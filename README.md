@@ -185,6 +185,15 @@ edge windows and the same pre-order draw order. Regular commands are packed into
 batches; a separate committed command buffer per pass guarantees that each pass
 sees the previous pass's writes.
 
+The same pass plan runs without a GPU: `render_cpu_passes` mirrors every pass
+(snapshot, mask, shadow, glow, glass, liquid, box blur and Gaussian) with the
+MSL kernels' integer arithmetic, so `raster --backend software` writes the bytes
+Metal reads back. `tests/software_effects.rs` pins the P6 digest of a display
+list carrying all eight effect kinds on any host, asserts Metal/software byte
+equality on macOS, and runs the cross-repo `cmp` proof against the independent
+renderer with no GPU involved: `PROOF software-96x64: cmp=identical bytes=18445
+digest=1dc0303be6e1b8b2` (the same bytes the Metal proof reports).
+
 `effect_gaussian_blur` is a sixth visual effect that improves shadow and backdrop
 quality: shadows blur with a Gaussian
 `MaskFilter.blur`, while the plain `effect_blur` is a uniform box blur whose
@@ -417,9 +426,10 @@ shapes reach the GPU as CPU-decomposed rectangles, and the system default Metal 
 one queried. The dispatch path, the readback equality proof and the on-screen presentation
 comparison are the verified properties of this backend.
 No Metal API call in this backend is substituted with a software stub. The only
-software implementations are the explicitly separate CPU parsing/oracle path used
-for unit tests and the headless Vulkan command *recorder* (record-only, no driver), while `raster` always performs the Metal dispatch on macOS and
-the presentation dylib always blits the compute buffer into a real drawable.
+software implementations are the explicitly separate CPU parsing/oracle path
+behind `--backend software` and the headless Vulkan command *recorder*
+(record-only, no driver), while `raster` defaults to the Metal dispatch on macOS
+and the presentation dylib always blits the compute buffer into a real drawable.
 
 ## API notes
 
