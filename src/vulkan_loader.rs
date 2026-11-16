@@ -258,7 +258,12 @@ impl VulkanLibrary {
     /// inside its library, so it is a candidate like the .so loader names.
     #[cfg(unix)]
     pub(crate) fn load() -> Result<Self, &'static str> {
-        for name in ["libvulkan.so.1", "libvulkan.so", "libMoltenVK.dylib"] {
+        for name in [
+            "libvulkan.so.1",
+            "libvulkan.so",
+            "libvulkan.dylib",
+            "libMoltenVK.dylib",
+        ] {
             let path = CString::new(name).expect("loader names contain no NUL");
             // SAFETY: dlopen with a valid path; the handle is closed once.
             let handle = unsafe { dlopen(path.as_ptr().cast::<c_char>(), RTLD_NOW | RTLD_LOCAL) };

@@ -272,8 +272,13 @@ shared with Metal, and the recorded bytes are unchanged by execution.
 A driver arithmetic difference is a real failure the gate exposes, never a
 reason to accept approximate equality: Vulkan must byte-match the CPU oracle
 and the Metal readback, because every kernel is integer-only. The execute gate
-is **CI-verified** on lavapipe (the optional `mesa-vulkan-drivers` apt step);
-on a host with no loader it prints `SKIP` and asserts no fake success. A
+is verified on lavapipe (the optional `mesa-vulkan-drivers` CI apt step) and
+reproducible on macOS with the Android SDK's bundled loader and lavapipe ICD:
+after `cargo test --no-run`, set `DYLD_LIBRARY_PATH` to the SDK's
+`emulator/lib64/vulkan` directory and `VK_ICD_FILENAMES` to its `lvp_icd.json`,
+then run the built test binaries or `raster --backend vulkan`. (Set them only
+for the test process: exporting them into `cargo` itself swaps rustc's LLVM.)
+On a host with no loader it prints `SKIP` and asserts no fake success. A
 fake-loader fixture (`tests/fixtures/fake_vulkan_loader.c`) exercises the
 loader-present/instance-fails path locally: `backends` must report
 `vulkan=unavailable` without calling an unresolved entry point or crashing.

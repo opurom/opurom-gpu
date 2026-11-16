@@ -40,6 +40,7 @@ const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
 const VK_STRUCTURE_TYPE_MEMORY_BARRIER: u32 = 46;
 
 const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x20;
+const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
 const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 const VK_ACCESS_MEMORY_READ_BIT: u32 = 0x8000;
 const VK_ACCESS_MEMORY_WRITE_BIT: u32 = 0x10000;
@@ -1329,242 +1330,257 @@ impl VulkanSession {
         }
         let buffers = [&frame_a, &frame_b, &backdrop, &mask, &commands];
 
-        let pool_size = DescriptorPoolSize {
-            descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            descriptor_count: 10,
-        };
-        let pool_info = DescriptorPoolCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            max_sets: 2,
-            pool_size_count: 1,
-            p_pool_sizes: &pool_size,
-        };
-        let mut pool = std::ptr::null_mut();
-        // SAFETY: two descriptor sets, ten storage-buffer descriptors.
-        let result =
-            unsafe { (f.create_pool)(self.device, &pool_info, std::ptr::null(), &mut pool) };
-        if result != VK_SUCCESS {
-            return Err(GpuError::Vulkan("vkCreateDescriptorPool failed".to_owned()));
-        }
-        let layouts = [self.set_layout, self.set_layout];
-        let allocate_sets = DescriptorSetAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            descriptor_pool: pool,
-            descriptor_set_count: 2,
-            p_set_layouts: layouts.as_ptr(),
-        };
-        let mut sets = [std::ptr::null_mut(); 2];
-        // SAFETY: the pool can supply exactly two sets of this layout.
-        let result = unsafe { (f.allocate_sets)(self.device, &allocate_sets, sets.as_mut_ptr()) };
-        if result != VK_SUCCESS {
-            unsafe { (f.destroy_pool)(self.device, pool, std::ptr::null()) };
-            return Err(GpuError::Vulkan(
-                "vkAllocateDescriptorSets failed".to_owned(),
-            ));
-        }
-        let infos: Vec<DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|buffer| DescriptorBufferInfo {
-                buffer: buffer.buffer,
-                offset: 0,
-                range: buffer.size as u64,
-            })
-            .collect();
-        let mut writes = Vec::with_capacity(10);
-        for (set_index, order) in [[0usize, 1], [1, 0]].into_iter().enumerate() {
-            for binding in 0..5usize {
-                let info_index = match binding {
-                    0 => order[0],
-                    1 => order[1],
-                    other => other,
-                };
-                writes.push(WriteDescriptorSet {
-                    s_type: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    p_next: std::ptr::null(),
-                    dst_set: sets[set_index],
-                    dst_binding: binding as u32,
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    p_image_info: std::ptr::null(),
-                    p_buffer_info: &infos[info_index],
-                    p_texel_buffer_view: std::ptr::null(),
-                });
+        // Per-render handles live in outer slots so cleanup runs on every
+        // error path. Session-owned layout and pipelines are never destroyed
+        // here: a second render on the same session must reuse them.
+        let mut pool: *mut c_void = std::ptr::null_mut();
+        let mut command_pool: *mut c_void = std::ptr::null_mut();
+        let outcome: Result<Vec<u8>, GpuError> = (|| {
+            let pool_size = DescriptorPoolSize {
+                descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptor_count: 10,
+            };
+            let pool_info = DescriptorPoolCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                max_sets: 2,
+                pool_size_count: 1,
+                p_pool_sizes: &pool_size,
+            };
+            // SAFETY: two descriptor sets, ten storage-buffer descriptors.
+            let result =
+                unsafe { (f.create_pool)(self.device, &pool_info, std::ptr::null(), &mut pool) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkCreateDescriptorPool failed".to_owned()));
             }
-        }
-        // SAFETY: the buffer infos outlive this call; all sets/pool are live.
-        unsafe {
-            (f.update_sets)(
-                self.device,
-                writes.len() as u32,
-                writes.as_ptr(),
-                0,
-                std::ptr::null(),
-            )
-        };
-
-        let pool_info = CommandPoolCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            queue_family_index: self.queue_family,
-        };
-        let mut command_pool = std::ptr::null_mut();
-        // SAFETY: a valid queue family index from device creation.
-        let result = unsafe {
-            (f.create_command_pool)(self.device, &pool_info, std::ptr::null(), &mut command_pool)
-        };
-        if result != VK_SUCCESS {
-            unsafe { (f.destroy_pool)(self.device, pool, std::ptr::null()) };
-            return Err(GpuError::Vulkan("vkCreateCommandPool failed".to_owned()));
-        }
-        let command_info = CommandBufferAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            command_pool,
-            level: 0,
-            command_buffer_count: 1,
-        };
-        let mut command = std::ptr::null_mut();
-        // SAFETY: the pool has room for one primary command buffer.
-        let result = unsafe { (f.allocate_commands)(self.device, &command_info, &mut command) };
-        if result != VK_SUCCESS {
+            let layouts = [self.set_layout, self.set_layout];
+            let allocate_sets = DescriptorSetAllocateInfo {
+                s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                p_next: std::ptr::null(),
+                descriptor_pool: pool,
+                descriptor_set_count: 2,
+                p_set_layouts: layouts.as_ptr(),
+            };
+            let mut sets = [std::ptr::null_mut(); 2];
+            // SAFETY: the pool can supply exactly two sets of this layout.
+            let result =
+                unsafe { (f.allocate_sets)(self.device, &allocate_sets, sets.as_mut_ptr()) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan(
+                    "vkAllocateDescriptorSets failed".to_owned(),
+                ));
+            }
+            let infos: Vec<DescriptorBufferInfo> = buffers
+                .iter()
+                .map(|buffer| DescriptorBufferInfo {
+                    buffer: buffer.buffer,
+                    offset: 0,
+                    range: buffer.size as u64,
+                })
+                .collect();
+            let mut writes = Vec::with_capacity(10);
+            for (set_index, order) in [[0usize, 1], [1, 0]].into_iter().enumerate() {
+                for binding in 0..5usize {
+                    let info_index = match binding {
+                        0 => order[0],
+                        1 => order[1],
+                        other => other,
+                    };
+                    writes.push(WriteDescriptorSet {
+                        s_type: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        p_next: std::ptr::null(),
+                        dst_set: sets[set_index],
+                        dst_binding: binding as u32,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        p_image_info: std::ptr::null(),
+                        p_buffer_info: &infos[info_index],
+                        p_texel_buffer_view: std::ptr::null(),
+                    });
+                }
+            }
+            // SAFETY: the buffer infos outlive this call; all sets/pool are live.
             unsafe {
+                (f.update_sets)(
+                    self.device,
+                    writes.len() as u32,
+                    writes.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+
+            let pool_info = CommandPoolCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                queue_family_index: self.queue_family,
+            };
+            // SAFETY: a valid queue family index from device creation.
+            let result = unsafe {
+                (f.create_command_pool)(
+                    self.device,
+                    &pool_info,
+                    std::ptr::null(),
+                    &mut command_pool,
+                )
+            };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkCreateCommandPool failed".to_owned()));
+            }
+            let command_info = CommandBufferAllocateInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                p_next: std::ptr::null(),
+                command_pool,
+                level: 0,
+                command_buffer_count: 1,
+            };
+            let mut command = std::ptr::null_mut();
+            // SAFETY: the pool has room for one primary command buffer.
+            let result = unsafe { (f.allocate_commands)(self.device, &command_info, &mut command) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan(
+                    "vkAllocateCommandBuffers failed".to_owned(),
+                ));
+            }
+            let begin_info = CommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: std::ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                p_inheritance_info: std::ptr::null(),
+            };
+            // SAFETY: the command buffer was allocated from a live pool.
+            let result = unsafe { (f.begin_command)(command, 0, &begin_info) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkBeginCommandBuffer failed".to_owned()));
+            }
+
+            let barrier = MemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access_mask: VK_ACCESS_MEMORY_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_MEMORY_READ_BIT,
+            };
+            let groups = pixel_count.div_ceil(LOCAL_SIZE as usize) as u32;
+            let mut current = 0usize;
+            for pass in &passes {
+                let vertical = pass.kernel == KERNEL_BLUR_V || pass.kernel == KERNEL_GAUSSIAN_V;
+                let set = sets[current ^ usize::from(vertical)];
+                // SAFETY: all pipelines, descriptor sets and push constants are
+                // live; bindings mirror the Metal ping-pong, including the
+                // vertical-pass buffer-role reversal.
+                unsafe {
+                    (f.bind_pipeline)(
+                        command,
+                        VK_PIPELINE_BIND_POINT_COMPUTE,
+                        self.pipelines[pass.kernel as usize],
+                    );
+                    (f.bind_sets)(
+                        command,
+                        VK_PIPELINE_BIND_POINT_COMPUTE,
+                        self.pipeline_layout,
+                        0,
+                        1,
+                        &set,
+                        0,
+                        std::ptr::null(),
+                    );
+                    (f.push_constants)(
+                        command,
+                        self.pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT,
+                        0,
+                        (PARAM_WORDS * 4) as u32,
+                        pass.params.as_ptr().cast::<c_void>(),
+                    );
+                    (f.dispatch)(command, groups, 1, 1);
+                    (f.barrier)(
+                        command,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        1,
+                        &barrier,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                    );
+                }
+                if pass.kernel == KERNEL_EFFECT {
+                    current ^= 1;
+                }
+            }
+            // SAFETY: every pass was recorded with at least one dispatch.
+            let result = unsafe { (f.end_command)(command) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkEndCommandBuffer failed".to_owned()));
+            }
+
+            let fence_info = FenceCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+            };
+            let mut fence = std::ptr::null_mut();
+            // SAFETY: an unsignalled fence for this device.
+            let result =
+                unsafe { (f.create_fence)(self.device, &fence_info, std::ptr::null(), &mut fence) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkCreateFence failed".to_owned()));
+            }
+            let submit = SubmitInfo {
+                s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                p_next: std::ptr::null(),
+                wait_semaphore_count: 0,
+                p_wait_semaphores: std::ptr::null(),
+                p_wait_dst_stage_mask: std::ptr::null(),
+                command_buffer_count: 1,
+                p_command_buffers: &command,
+                signal_semaphore_count: 0,
+                p_signal_semaphores: std::ptr::null(),
+            };
+            // SAFETY: one recorded command buffer on a compute queue, fenced.
+            let result = unsafe { (f.submit)(self.queue, 1, &submit, fence) };
+            if result == VK_SUCCESS {
+                // SAFETY: the fence is the only wait target; no timeout.
+                let result = unsafe { (f.wait_fences)(self.device, 1, &fence, 1, u64::MAX) };
+                if result != VK_SUCCESS {
+                    return Err(GpuError::Vulkan("vkWaitForFences failed".to_owned()));
+                }
+            }
+            // SAFETY: the fence was created above and the queue is idle.
+            unsafe { (f.destroy_fence)(self.device, fence, std::ptr::null()) };
+            if result != VK_SUCCESS {
+                return Err(GpuError::Vulkan("vkQueueSubmit failed".to_owned()));
+            }
+
+            let source = if current == 0 { &frame_a } else { &frame_b };
+            // SAFETY: host-visible coherent mapping, queue idle after the fence.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(source.mapped as *const u8, byte_count).to_vec()
+            };
+
+            Ok(pixels)
+        })();
+        // SAFETY: every non-null handle was created inside the closure on this
+        // device; the session's descriptor set layout and pipelines stay alive.
+        unsafe {
+            if !command_pool.is_null() {
                 (f.destroy_command_pool)(self.device, command_pool, std::ptr::null());
+            }
+            if !pool.is_null() {
                 (f.destroy_pool)(self.device, pool, std::ptr::null());
             }
-            return Err(GpuError::Vulkan(
-                "vkAllocateCommandBuffers failed".to_owned(),
-            ));
-        }
-        let begin_info = CommandBufferBeginInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            p_next: std::ptr::null(),
-            flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            p_inheritance_info: std::ptr::null(),
-        };
-        // SAFETY: the command buffer was allocated from a live pool.
-        let result = unsafe { (f.begin_command)(command, 0, &begin_info) };
-        if result != VK_SUCCESS {
-            return Err(GpuError::Vulkan("vkBeginCommandBuffer failed".to_owned()));
-        }
-
-        let barrier = MemoryBarrier {
-            s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: VK_ACCESS_MEMORY_WRITE_BIT,
-            dst_access_mask: VK_ACCESS_MEMORY_READ_BIT,
-        };
-        let groups = pixel_count.div_ceil(LOCAL_SIZE as usize) as u32;
-        let mut current = 0usize;
-        for pass in &passes {
-            let vertical = pass.kernel == KERNEL_BLUR_V || pass.kernel == KERNEL_GAUSSIAN_V;
-            let set = sets[current ^ usize::from(vertical)];
-            // SAFETY: all pipelines, descriptor sets and push constants are
-            // live; bindings mirror the Metal ping-pong, including the
-            // vertical-pass buffer-role reversal.
-            unsafe {
-                (f.bind_pipeline)(command, 3, self.pipelines[pass.kernel as usize]);
-                (f.bind_sets)(
-                    command,
-                    3,
-                    self.pipeline_layout,
-                    0,
-                    1,
-                    &set,
-                    0,
-                    std::ptr::null(),
-                );
-                (f.push_constants)(
-                    command,
-                    self.pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT,
-                    0,
-                    (PARAM_WORDS * 4) as u32,
-                    pass.params.as_ptr().cast::<c_void>(),
-                );
-                (f.dispatch)(command, groups, 1, 1);
-                (f.barrier)(
-                    command,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0,
-                    1,
-                    &barrier,
-                    0,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                );
-            }
-            if pass.kernel == KERNEL_EFFECT {
-                current ^= 1;
-            }
-        }
-        // SAFETY: every pass was recorded with at least one dispatch.
-        let result = unsafe { (f.end_command)(command) };
-        if result != VK_SUCCESS {
-            return Err(GpuError::Vulkan("vkEndCommandBuffer failed".to_owned()));
-        }
-
-        let fence_info = FenceCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-        };
-        let mut fence = std::ptr::null_mut();
-        // SAFETY: an unsignalled fence for this device.
-        let result =
-            unsafe { (f.create_fence)(self.device, &fence_info, std::ptr::null(), &mut fence) };
-        if result != VK_SUCCESS {
-            return Err(GpuError::Vulkan("vkCreateFence failed".to_owned()));
-        }
-        let submit = SubmitInfo {
-            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 0,
-            p_wait_semaphores: std::ptr::null(),
-            p_wait_dst_stage_mask: std::ptr::null(),
-            command_buffer_count: 1,
-            p_command_buffers: &command,
-            signal_semaphore_count: 0,
-            p_signal_semaphores: std::ptr::null(),
-        };
-        // SAFETY: one recorded command buffer on a compute queue, fenced.
-        let result = unsafe { (f.submit)(self.queue, 1, &submit, fence) };
-        if result == VK_SUCCESS {
-            // SAFETY: the fence is the only wait target; no timeout.
-            let result = unsafe { (f.wait_fences)(self.device, 1, &fence, 1, u64::MAX) };
-            if result != VK_SUCCESS {
-                return Err(GpuError::Vulkan("vkWaitForFences failed".to_owned()));
-            }
-        }
-        // SAFETY: the fence was created above and the queue is idle.
-        unsafe { (f.destroy_fence)(self.device, fence, std::ptr::null()) };
-        if result != VK_SUCCESS {
-            return Err(GpuError::Vulkan("vkQueueSubmit failed".to_owned()));
-        }
-
-        let source = if current == 0 { &frame_a } else { &frame_b };
-        // SAFETY: host-visible coherent mapping, queue idle after the fence.
-        let pixels =
-            unsafe { std::slice::from_raw_parts(source.mapped as *const u8, byte_count).to_vec() };
-
-        // SAFETY: every resource below was created above on this device.
-        unsafe {
-            (f.destroy_command_pool)(self.device, command_pool, std::ptr::null());
-            (f.destroy_pool)(self.device, pool, std::ptr::null());
-            (f.destroy_set_layout)(self.device, self.set_layout, std::ptr::null());
             for buffer in buffers {
                 (f.unmap_memory)(self.device, buffer.memory);
                 (f.free_memory)(self.device, buffer.memory, std::ptr::null());
                 (f.destroy_buffer)(self.device, buffer.buffer, std::ptr::null());
             }
         }
-        Ok(pixels)
+        outcome
     }
 }
 
