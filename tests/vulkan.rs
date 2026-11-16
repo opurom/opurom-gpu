@@ -653,3 +653,53 @@ fn raster_vulkan_cli_honest_execution() {
         assert!(String::from_utf8_lossy(&run.stderr).contains("unavailable"));
     }
 }
+
+/// A loader that answers `vkGetInstanceProcAddr` but cannot create an
+/// instance must degrade honestly. This used to call the loader's entry point
+/// through a `vkCreateInstance` signature and segfault before any test ran.
+#[test]
+fn loader_without_instance_degrades_without_crash() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let library = dir.join("libvulkan.so.1");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake_vulkan_loader.c");
+    let compile = if cfg!(target_os = "macos") {
+        ProcessCommand::new("cc")
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+    } else {
+        ProcessCommand::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+    };
+    if !compile.is_ok_and(|status| status.success()) || !library.is_file() {
+        vulkan_skip("no C compiler for the fake loader; honest-degradation path untested");
+        return;
+    }
+    let out = ProcessCommand::new(env!("CARGO_BIN_EXE_opurom-gpu"))
+        .arg("backends")
+        .env("LD_LIBRARY_PATH", &dir)
+        .env("DYLD_LIBRARY_PATH", &dir)
+        .output()
+        .expect("backends must run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a loader without an instance must never crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("vulkan=unavailable"),
+        "a failed instance must be reported honestly: {stdout}"
+    );
+    if stdout.contains("Vulkan instance creation failed") {
+        println!("PROOF fake-loader: vkCreateInstance failed honestly, no crash");
+    }
+}

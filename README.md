@@ -273,7 +273,10 @@ A driver arithmetic difference is a real failure the gate exposes, never a
 reason to accept approximate equality: Vulkan must byte-match the CPU oracle
 and the Metal readback, because every kernel is integer-only. The execute gate
 is **CI-verified** on lavapipe (the optional `mesa-vulkan-drivers` apt step);
-on a host with no loader it prints `SKIP` and asserts no fake success.
+on a host with no loader it prints `SKIP` and asserts no fake success. A
+fake-loader fixture (`tests/fixtures/fake_vulkan_loader.c`) exercises the
+loader-present/instance-fails path locally: `backends` must report
+`vulkan=unavailable` without calling an unresolved entry point or crashing.
 
 Typed commands (`VkCommand`), matching the display-list primitives:
 
@@ -442,8 +445,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **81 tests**
-(42 unit tests and thirty-nine integration tests, ten of which are the headless
+that no fake success occurs. On macOS, `cargo test --offline` runs **82 tests**
+(42 unit tests and forty integration tests, ten of which are the headless
 Vulkan recorder proofs), including the cross-repo `cmp` proofs in
 `tests/display.rs`, `tests/effects.rs` and `tests/software_effects.rs` and the
 Metal/CPU equality proof for a mixed stream containing particles; GPU execution

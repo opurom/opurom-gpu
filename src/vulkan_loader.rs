@@ -238,7 +238,6 @@ type DestroyDeviceFn = unsafe extern "system" fn(*mut c_void, *const c_void);
 pub(crate) struct VulkanLibrary {
     pub(crate) handle: *mut c_void,
     pub(crate) get_instance_proc_addr: GetInstanceProcAddrFn,
-    create_instance: CreateInstanceFn,
 }
 
 #[cfg(unix)]
@@ -273,16 +272,15 @@ impl VulkanLibrary {
                 unsafe { dlclose(handle) };
                 continue;
             }
-            // SAFETY: the loader exports vkCreateInstance through its entry
-            // point with a null instance handle.
-            let create_instance =
-                unsafe { std::mem::transmute::<*mut c_void, CreateInstanceFn>(entry) };
+            // Only the loader's vkGetInstanceProcAddr is stored here. Every
+            // other entry point must be resolved through it with the right
+            // instance handle; transmuting this pointer to vkCreateInstance
+            // would call the wrong ABI and crash on hosts that have a loader.
             return Ok(Self {
                 handle,
                 get_instance_proc_addr: unsafe {
                     std::mem::transmute::<*mut c_void, GetInstanceProcAddrFn>(entry)
                 },
-                create_instance,
             });
         }
         Err("no Vulkan loader found on this host")
@@ -363,11 +361,15 @@ fn run_probe() -> VulkanProbe {
         enabled_extension_count: 0,
         pp_enabled_extension_names: std::ptr::null(),
     };
+    let create_instance: CreateInstanceFn =
+        match resolve(&library, std::ptr::null_mut(), "vkCreateInstance") {
+            Ok(create) => create,
+            Err(note) => return unavailable(note),
+        };
     let mut instance: *mut c_void = std::ptr::null_mut();
     // SAFETY: valid create info with no extensions or layers; result checked.
-    let result =
-        unsafe { (library.create_instance)(&create_info, std::ptr::null(), &mut instance) };
-    if result != VK_SUCCESS {
+    let result = unsafe { create_instance(&create_info, std::ptr::null(), &mut instance) };
+    if result != VK_SUCCESS || instance.is_null() {
         return unavailable("Vulkan instance creation failed");
     }
 

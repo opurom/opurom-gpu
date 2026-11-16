@@ -338,8 +338,8 @@ struct MemoryBarrier {
 }
 
 macro_rules! vk_fn {
-    ($library:expr, $name:literal, $ty:ty) => {
-        resolve::<$ty>($library, std::ptr::null_mut(), $name)
+    ($library:expr, $instance:expr, $name:literal, $ty:ty) => {
+        resolve::<$ty>($library, $instance, $name)
             .map_err(|reason| GpuError::Vulkan(reason.to_owned()))?
     };
 }
@@ -490,7 +490,9 @@ struct SessionFns {
 unsafe impl Send for VulkanSession {}
 
 pub(crate) struct VulkanSession {
-    library: VulkanLibrary,
+    // Kept alive for the process lifetime: closing the dlopen handle while a
+    // device or instance still exists would invalidate resolved entry points.
+    _library: VulkanLibrary,
     instance: *mut c_void,
     device: *mut c_void,
     queue: *mut c_void,
@@ -525,338 +527,16 @@ impl VulkanSession {
     fn acquire() -> Result<Self, GpuError> {
         let library =
             VulkanLibrary::load().map_err(|reason| GpuError::Vulkan(reason.to_owned()))?;
-        let functions = SessionFns {
-            enumerate: vk_fn!(
-                &library,
-                "vkEnumeratePhysicalDevices",
-                unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32
-            ),
-            get_properties: vk_fn!(
-                &library,
-                "vkGetPhysicalDeviceProperties",
-                unsafe extern "system" fn(*mut c_void, *mut Properties)
-            ),
-            get_features: vk_fn!(
-                &library,
-                "vkGetPhysicalDeviceFeatures",
-                unsafe extern "system" fn(*mut c_void, *mut PhysicalDeviceFeatures)
-            ),
-            get_memory_properties: vk_fn!(
-                &library,
-                "vkGetPhysicalDeviceMemoryProperties",
-                unsafe extern "system" fn(*mut c_void, *mut MemoryProperties)
-            ),
-            get_queue_families: vk_fn!(
-                &library,
-                "vkGetPhysicalDeviceQueueFamilyProperties",
-                unsafe extern "system" fn(*mut c_void, *mut u32, *mut QueueFamily)
-            ),
-            create_device: vk_fn!(
-                &library,
-                "vkCreateDevice",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const DeviceCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            get_device_queue: vk_fn!(
-                &library,
-                "vkGetDeviceQueue",
-                unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void)
-            ),
-            create_buffer: vk_fn!(
-                &library,
-                "vkCreateBuffer",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const BufferCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            get_buffer_requirements: vk_fn!(
-                &library,
-                "vkGetBufferMemoryRequirements",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut MemoryRequirements)
-            ),
-            allocate_memory: vk_fn!(
-                &library,
-                "vkAllocateMemory",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const MemoryAllocateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            bind_buffer_memory: vk_fn!(
-                &library,
-                "vkBindBufferMemory",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, u64) -> i32
-            ),
-            map_memory: vk_fn!(
-                &library,
-                "vkMapMemory",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *mut c_void,
-                    u64,
-                    u64,
-                    u32,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            unmap_memory: vk_fn!(
-                &library,
-                "vkUnmapMemory",
-                unsafe extern "system" fn(*mut c_void, *mut c_void)
-            ),
-            free_memory: vk_fn!(
-                &library,
-                "vkFreeMemory",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_buffer: vk_fn!(
-                &library,
-                "vkDestroyBuffer",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            create_set_layout: vk_fn!(
-                &library,
-                "vkCreateDescriptorSetLayout",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const DescriptorSetLayoutCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            create_pool: vk_fn!(
-                &library,
-                "vkCreateDescriptorPool",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const DescriptorPoolCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            allocate_sets: vk_fn!(
-                &library,
-                "vkAllocateDescriptorSets",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const DescriptorSetAllocateInfo,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            update_sets: vk_fn!(
-                &library,
-                "vkUpdateDescriptorSets",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    *const WriteDescriptorSet,
-                    u32,
-                    *const c_void,
-                )
-            ),
-            create_module: vk_fn!(
-                &library,
-                "vkCreateShaderModule",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const ShaderModuleCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            create_pipeline_layout: vk_fn!(
-                &library,
-                "vkCreatePipelineLayout",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const PipelineLayoutCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            create_pipelines: vk_fn!(
-                &library,
-                "vkCreateComputePipelines",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *mut c_void,
-                    u32,
-                    *const ComputePipelineCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            create_command_pool: vk_fn!(
-                &library,
-                "vkCreateCommandPool",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const CommandPoolCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            allocate_commands: vk_fn!(
-                &library,
-                "vkAllocateCommandBuffers",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const CommandBufferAllocateInfo,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            begin_command: vk_fn!(
-                &library,
-                "vkBeginCommandBuffer",
-                unsafe extern "system" fn(*mut c_void, u32, *const CommandBufferBeginInfo) -> i32
-            ),
-            end_command: vk_fn!(
-                &library,
-                "vkEndCommandBuffer",
-                unsafe extern "system" fn(*mut c_void) -> i32
-            ),
-            bind_pipeline: vk_fn!(
-                &library,
-                "vkCmdBindPipeline",
-                unsafe extern "system" fn(*mut c_void, u32, *mut c_void)
-            ),
-            bind_sets: vk_fn!(
-                &library,
-                "vkCmdBindDescriptorSets",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    *mut c_void,
-                    u32,
-                    u32,
-                    *const *mut c_void,
-                    u32,
-                    *const u32,
-                )
-            ),
-            push_constants: vk_fn!(
-                &library,
-                "vkCmdPushConstants",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *const c_void)
-            ),
-            dispatch: vk_fn!(
-                &library,
-                "vkCmdDispatch",
-                unsafe extern "system" fn(*mut c_void, u32, u32, u32)
-            ),
-            barrier: vk_fn!(
-                &library,
-                "vkCmdPipelineBarrier",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    u32,
-                    u32,
-                    u32,
-                    *const MemoryBarrier,
-                    u32,
-                    *const c_void,
-                    u32,
-                    *const c_void,
-                )
-            ),
-            create_fence: vk_fn!(
-                &library,
-                "vkCreateFence",
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const FenceCreateInfo,
-                    *const c_void,
-                    *mut *mut c_void,
-                ) -> i32
-            ),
-            submit: vk_fn!(
-                &library,
-                "vkQueueSubmit",
-                unsafe extern "system" fn(*mut c_void, u32, *const SubmitInfo, *mut c_void) -> i32
-            ),
-            wait_fences: vk_fn!(
-                &library,
-                "vkWaitForFences",
-                unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, u32, u64) -> i32
-            ),
-            destroy_fence: vk_fn!(
-                &library,
-                "vkDestroyFence",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_command_pool: vk_fn!(
-                &library,
-                "vkDestroyCommandPool",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_pool: vk_fn!(
-                &library,
-                "vkDestroyDescriptorPool",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_set_layout: vk_fn!(
-                &library,
-                "vkDestroyDescriptorSetLayout",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_pipeline_layout: vk_fn!(
-                &library,
-                "vkDestroyPipelineLayout",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_pipeline: vk_fn!(
-                &library,
-                "vkDestroyPipeline",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_module: vk_fn!(
-                &library,
-                "vkDestroyShaderModule",
-                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
-            ),
-            destroy_device: vk_fn!(
-                &library,
-                "vkDestroyDevice",
-                unsafe extern "system" fn(*mut c_void, *const c_void)
-            ),
-            destroy_instance: vk_fn!(
-                &library,
-                "vkDestroyInstance",
-                unsafe extern "system" fn(*mut c_void, *const c_void)
-            ),
-        };
-        let mut session = Self {
-            library,
-            instance: std::ptr::null_mut(),
-            device: std::ptr::null_mut(),
-            queue: std::ptr::null_mut(),
-            queue_family: 0,
-            memory_types: Vec::new(),
-            set_layout: std::ptr::null_mut(),
-            pipeline_layout: std::ptr::null_mut(),
-            pipelines: [std::ptr::null_mut(); 8],
-            functions,
-            device_name: String::new(),
-        };
-        // Resolve the instance-level entry points before vkCreateInstance:
-        // `vk_fn!` above already used the loader's null-instance trampoline.
+        // vkCreateInstance is a global command: resolve it with a null
+        // instance, then resolve every other entry point with the real
+        // instance handle (Vulkan requires this for instance-level commands).
         let create_instance = resolve::<
             unsafe extern "system" fn(
                 *const InstanceCreateInfo,
                 *const c_void,
                 *mut *mut c_void,
             ) -> i32,
-        >(&session.library, std::ptr::null_mut(), "vkCreateInstance")
+        >(&library, std::ptr::null_mut(), "vkCreateInstance")
         .map_err(|reason| GpuError::Vulkan(reason.to_owned()))?;
 
         let application = ApplicationInfo {
@@ -878,14 +558,380 @@ impl VulkanSession {
             enabled_extension_count: 0,
             pp_enabled_extension_names: std::ptr::null(),
         };
+        let mut instance: *mut c_void = std::ptr::null_mut();
         // SAFETY: a valid instance create info with no extensions or layers.
-        let result =
-            unsafe { create_instance(&create_info, std::ptr::null(), &mut session.instance) };
-        if result != VK_SUCCESS {
+        let result = unsafe { create_instance(&create_info, std::ptr::null(), &mut instance) };
+        if result != VK_SUCCESS || instance.is_null() {
             return Err(GpuError::Vulkan(format!(
                 "vkCreateInstance failed: {result}"
             )));
         }
+        let functions = SessionFns {
+            enumerate: vk_fn!(
+                &library,
+                instance,
+                "vkEnumeratePhysicalDevices",
+                unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32
+            ),
+            get_properties: vk_fn!(
+                &library,
+                instance,
+                "vkGetPhysicalDeviceProperties",
+                unsafe extern "system" fn(*mut c_void, *mut Properties)
+            ),
+            get_features: vk_fn!(
+                &library,
+                instance,
+                "vkGetPhysicalDeviceFeatures",
+                unsafe extern "system" fn(*mut c_void, *mut PhysicalDeviceFeatures)
+            ),
+            get_memory_properties: vk_fn!(
+                &library,
+                instance,
+                "vkGetPhysicalDeviceMemoryProperties",
+                unsafe extern "system" fn(*mut c_void, *mut MemoryProperties)
+            ),
+            get_queue_families: vk_fn!(
+                &library,
+                instance,
+                "vkGetPhysicalDeviceQueueFamilyProperties",
+                unsafe extern "system" fn(*mut c_void, *mut u32, *mut QueueFamily)
+            ),
+            create_device: vk_fn!(
+                &library,
+                instance,
+                "vkCreateDevice",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const DeviceCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            get_device_queue: vk_fn!(
+                &library,
+                instance,
+                "vkGetDeviceQueue",
+                unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void)
+            ),
+            create_buffer: vk_fn!(
+                &library,
+                instance,
+                "vkCreateBuffer",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const BufferCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            get_buffer_requirements: vk_fn!(
+                &library,
+                instance,
+                "vkGetBufferMemoryRequirements",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut MemoryRequirements)
+            ),
+            allocate_memory: vk_fn!(
+                &library,
+                instance,
+                "vkAllocateMemory",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const MemoryAllocateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            bind_buffer_memory: vk_fn!(
+                &library,
+                instance,
+                "vkBindBufferMemory",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, u64) -> i32
+            ),
+            map_memory: vk_fn!(
+                &library,
+                instance,
+                "vkMapMemory",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u64,
+                    u64,
+                    u32,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            unmap_memory: vk_fn!(
+                &library,
+                instance,
+                "vkUnmapMemory",
+                unsafe extern "system" fn(*mut c_void, *mut c_void)
+            ),
+            free_memory: vk_fn!(
+                &library,
+                instance,
+                "vkFreeMemory",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_buffer: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyBuffer",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            create_set_layout: vk_fn!(
+                &library,
+                instance,
+                "vkCreateDescriptorSetLayout",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const DescriptorSetLayoutCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            create_pool: vk_fn!(
+                &library,
+                instance,
+                "vkCreateDescriptorPool",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const DescriptorPoolCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            allocate_sets: vk_fn!(
+                &library,
+                instance,
+                "vkAllocateDescriptorSets",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const DescriptorSetAllocateInfo,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            update_sets: vk_fn!(
+                &library,
+                instance,
+                "vkUpdateDescriptorSets",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    u32,
+                    *const WriteDescriptorSet,
+                    u32,
+                    *const c_void,
+                )
+            ),
+            create_module: vk_fn!(
+                &library,
+                instance,
+                "vkCreateShaderModule",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const ShaderModuleCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            create_pipeline_layout: vk_fn!(
+                &library,
+                instance,
+                "vkCreatePipelineLayout",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const PipelineLayoutCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            create_pipelines: vk_fn!(
+                &library,
+                instance,
+                "vkCreateComputePipelines",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u32,
+                    *const ComputePipelineCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            create_command_pool: vk_fn!(
+                &library,
+                instance,
+                "vkCreateCommandPool",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const CommandPoolCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            allocate_commands: vk_fn!(
+                &library,
+                instance,
+                "vkAllocateCommandBuffers",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const CommandBufferAllocateInfo,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            begin_command: vk_fn!(
+                &library,
+                instance,
+                "vkBeginCommandBuffer",
+                unsafe extern "system" fn(*mut c_void, u32, *const CommandBufferBeginInfo) -> i32
+            ),
+            end_command: vk_fn!(
+                &library,
+                instance,
+                "vkEndCommandBuffer",
+                unsafe extern "system" fn(*mut c_void) -> i32
+            ),
+            bind_pipeline: vk_fn!(
+                &library,
+                instance,
+                "vkCmdBindPipeline",
+                unsafe extern "system" fn(*mut c_void, u32, *mut c_void)
+            ),
+            bind_sets: vk_fn!(
+                &library,
+                instance,
+                "vkCmdBindDescriptorSets",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    u32,
+                    *mut c_void,
+                    u32,
+                    u32,
+                    *const *mut c_void,
+                    u32,
+                    *const u32,
+                )
+            ),
+            push_constants: vk_fn!(
+                &library,
+                instance,
+                "vkCmdPushConstants",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *const c_void)
+            ),
+            dispatch: vk_fn!(
+                &library,
+                instance,
+                "vkCmdDispatch",
+                unsafe extern "system" fn(*mut c_void, u32, u32, u32)
+            ),
+            barrier: vk_fn!(
+                &library,
+                instance,
+                "vkCmdPipelineBarrier",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    *const MemoryBarrier,
+                    u32,
+                    *const c_void,
+                    u32,
+                    *const c_void,
+                )
+            ),
+            create_fence: vk_fn!(
+                &library,
+                instance,
+                "vkCreateFence",
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const FenceCreateInfo,
+                    *const c_void,
+                    *mut *mut c_void,
+                ) -> i32
+            ),
+            submit: vk_fn!(
+                &library,
+                instance,
+                "vkQueueSubmit",
+                unsafe extern "system" fn(*mut c_void, u32, *const SubmitInfo, *mut c_void) -> i32
+            ),
+            wait_fences: vk_fn!(
+                &library,
+                instance,
+                "vkWaitForFences",
+                unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, u32, u64) -> i32
+            ),
+            destroy_fence: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyFence",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_command_pool: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyCommandPool",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_pool: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyDescriptorPool",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_set_layout: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyDescriptorSetLayout",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_pipeline_layout: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyPipelineLayout",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_pipeline: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyPipeline",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_module: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyShaderModule",
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void)
+            ),
+            destroy_device: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyDevice",
+                unsafe extern "system" fn(*mut c_void, *const c_void)
+            ),
+            destroy_instance: vk_fn!(
+                &library,
+                instance,
+                "vkDestroyInstance",
+                unsafe extern "system" fn(*mut c_void, *const c_void)
+            ),
+        };
+        let mut session = Self {
+            _library: library,
+            instance,
+            device: std::ptr::null_mut(),
+            queue: std::ptr::null_mut(),
+            queue_family: 0,
+            memory_types: Vec::new(),
+            set_layout: std::ptr::null_mut(),
+            pipeline_layout: std::ptr::null_mut(),
+            pipelines: [std::ptr::null_mut(); 8],
+            functions,
+            device_name: String::new(),
+        };
         session.init_device()?;
         session.init_pipelines()?;
         Ok(session)
