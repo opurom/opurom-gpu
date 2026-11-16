@@ -35,6 +35,11 @@ fn run() -> Result<(), String> {
                     BackendAvailability::Unavailable => "unavailable",
                 };
                 println!("{}={} ({})", backend.name(), label, status.note);
+                if backend == Backend::Vulkan {
+                    if let Some(detail) = opurom_gpu::vulkan_probe().detail_line() {
+                        println!("{detail}");
+                    }
+                }
             }
             Ok(())
         }

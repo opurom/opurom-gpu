@@ -1,9 +1,12 @@
 //! Headless Vulkan-style command recorder for Opurom display lists.
 //!
-//! This module never loads a Vulkan driver and never submits a command buffer.
-//! It translates the same validated, packed display-list stream that Metal
+//! This module never submits a command buffer and never touches a driver: it
+//! translates the same validated, packed display-list stream that Metal
 //! uploads into a typed command stream, then encodes that stream for headless
-//! inspection. Rect primitives become two-triangle draws, particle fields
+//! inspection. The honest driver probe (dlopen, instance, device, compute
+//! queue) lives in `vulkan_loader`; pixel execution stays pending until the
+//! SPIR-V compute pipeline lands, and the recorded stream stays the transport
+//! contract unchanged. Rect primitives become two-triangle draws, particle fields
 //! become point draws, per-command clips become scissor commands, framebuffer
 //! staging becomes `CopyBufferToImage`, and Metal compute passes become
 //! compute dispatches. A standalone triangle or image source command does not

@@ -474,15 +474,13 @@ fn backend_selector_reports_honest_availability() {
             note: Backend::Software.available().note,
         }
     );
-    // Vulkan is record-only everywhere: no driver is loaded headless.
-    assert_eq!(
+    // Vulkan availability is probed honestly: hosts with a real driver report
+    // record-only while the pixel compute pipeline is pending, and every other
+    // host reports exactly why it is unavailable.
+    assert!(matches!(
         Backend::Vulkan.available().availability,
-        BackendAvailability::RecordOnly
-    );
-    assert_eq!(
-        Backend::Vulkan.available().note,
-        "Vulkan command recording only; no driver is loaded headless"
-    );
+        BackendAvailability::RecordOnly | BackendAvailability::Unavailable
+    ));
 
     // Software runs the CPU oracle and yields a P6 PPM; Vulkan never pretends to
     // produce pixels.
@@ -497,4 +495,60 @@ fn backend_selector_reports_honest_availability() {
     assert_eq!(Backend::parse("metal"), Some(Backend::Metal));
     assert_eq!(Backend::parse("software"), Some(Backend::Software));
     assert_eq!(Backend::parse("d3d"), None);
+}
+
+/// The loader probe is cached, honest about the device it found, and drives
+/// the backend availability: usable hosts report record-only, every other
+/// host reports why it is unavailable. Recording never touches the driver.
+#[test]
+fn vulkan_probe_reports_what_the_host_has() {
+    let probe = opurom_gpu::vulkan_probe();
+    let again = opurom_gpu::vulkan_probe();
+    assert_eq!(
+        probe.note, again.note,
+        "the probe is cached once per process"
+    );
+    assert!(!probe.note.is_empty());
+    if probe.usable() {
+        assert!(!probe.device_name.is_empty());
+        assert!(probe.shader_int64);
+        assert!(probe.compute_queue_family.is_some());
+        assert!(
+            probe.api_version >= 0x40_0000,
+            "api version must be at least Vulkan 1.0"
+        );
+        assert_eq!(
+            Backend::Vulkan.available().availability,
+            BackendAvailability::RecordOnly
+        );
+        // Recording stays driver-free and byte-deterministic even on hosts
+        // with a live driver.
+        let list = full_list();
+        assert!(!record_stream(&list)
+            .expect("recording must work")
+            .is_empty());
+    } else {
+        assert_eq!(
+            Backend::Vulkan.available().availability,
+            BackendAvailability::Unavailable
+        );
+    }
+}
+
+/// The `backends` CLI reports all three backends and, on a host with a
+/// driver, the probed Vulkan device detail line.
+#[test]
+fn backends_cli_reports_three_backends_and_vulkan_detail() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opurom-gpu"))
+        .arg("backends")
+        .output()
+        .expect("backends must run");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("metal="));
+    assert!(stdout.contains("vulkan="));
+    assert!(stdout.contains("software="));
+    if opurom_gpu::vulkan_probe().usable() {
+        assert!(stdout.contains("vulkan.device="));
+    }
 }

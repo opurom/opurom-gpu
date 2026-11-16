@@ -60,13 +60,30 @@ fn assert_effect_byte_equality(renderer: &Path, ir: &Path, width: &str, height: 
     );
 
     let command_json = fs::read_to_string(&commands).expect("command stream must exist");
-    for kind in [
-        "effect_blur",
-        "effect_shadow",
-        "effect_glow",
-        "effect_glass",
-        "effect_liquid",
-    ] {
+    // The committed fixture carries every effect kind; the local ones sit
+    // inside the tall all-five-effects viewport, and the two GPU-only
+    // surfaces ride along. The smaller viewport clips the local nodes away,
+    // so only the whole-frame passes survive there.
+    let expected: &[&str] = if label == "all-five-effects" {
+        &[
+            "effect_backdrop",
+            "effect_mask",
+            "effect_blur",
+            "effect_gaussian_blur",
+            "effect_shadow",
+            "effect_glow",
+            "effect_glass",
+            "effect_liquid",
+        ]
+    } else {
+        &[
+            "effect_backdrop",
+            "effect_mask",
+            "effect_blur",
+            "effect_gaussian_blur",
+        ]
+    };
+    for kind in expected {
         assert!(
             command_json.contains(&format!("\"kind\":\"{kind}\"")),
             "{label}: {kind} command missing from the stream"
@@ -127,9 +144,10 @@ fn effect_gpu_ppm_is_byte_identical_to_independent_software_renderer() {
         skip("committed effect IR fixture ../opurom-render/tests/fixtures/effects.opuir.json not found");
         return;
     }
-    assert_effect_byte_equality(&renderer, ir, "96", "64", "all-five-effects");
-    // A second viewport exercises different bounds and clip intersections.
-    assert_effect_byte_equality(&renderer, ir, "64", "48", "small-viewport");
+    assert_effect_byte_equality(&renderer, ir, "96", "64", "small-viewport");
+    // Tall enough that every effect node of the committed fixture sits inside
+    // the viewport, so all five local effects are emitted and compared.
+    assert_effect_byte_equality(&renderer, ir, "96", "160", "all-five-effects");
 }
 
 #[cfg(not(target_os = "macos"))]

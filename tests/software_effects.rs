@@ -172,8 +172,8 @@ fn software_ppm_matches_independent_software_renderer() {
     }
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     for (width, height, label) in [
+        ("96", "160", "software-96x160"),
         ("96", "64", "software-96x64"),
-        ("64", "48", "software-64x48"),
     ] {
         let cpu_ppm = dir.join(format!("effects-{label}-cpu.ppm"));
         let gpu_ppm = dir.join(format!("effects-{label}-gpu.ppm"));

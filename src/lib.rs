@@ -23,6 +23,7 @@ mod metal;
 pub mod presentation;
 mod reference;
 pub mod vulkan;
+mod vulkan_loader;
 
 pub use display::{
     gaussian_blur_cpu, parse_display_list, render_cpu_commands, render_cpu_passes, Command,
@@ -36,6 +37,7 @@ pub use vulkan::{
     decode_stream, encode_stream, record_stream, VkCommand, VkCopyBufferToImage, VkDispatch,
     VkDraw, VkEffect, VkError, VkPipeline, VkPrimitive, VkRect2D, VulkanBackend,
 };
+pub use vulkan_loader::{vulkan_probe, VulkanProbe};
 
 /// Backend selected by `--backend`; `Software` is the in-crate CPU oracle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +52,7 @@ pub enum Backend {
 pub enum BackendAvailability {
     /// The host can execute this backend on a live device.
     Live,
-    /// The host records and encodes the backend without a live driver.
+    /// The host records and encodes the backend without executing pixels yet.
     RecordOnly,
     /// The host has no usable path for this backend.
     Unavailable,
@@ -83,9 +85,9 @@ impl Backend {
     }
 
     /// What this host can actually do: Metal is live only on macOS, Vulkan is
-    /// record-only everywhere (no driver is loaded), the software oracle is
-    /// always live.
-    pub const fn available(self) -> BackendStatus {
+    /// probed with a real driver load (record-only while the pixel compute
+    /// pipeline is pending), the software oracle is always live.
+    pub fn available(self) -> BackendStatus {
         let (availability, note) = match self {
             Self::Metal => {
                 if cfg!(target_os = "macos") {
@@ -97,10 +99,17 @@ impl Backend {
                     )
                 }
             }
-            Self::Vulkan => (
-                BackendAvailability::RecordOnly,
-                "Vulkan command recording only; no driver is loaded headless",
-            ),
+            Self::Vulkan => {
+                let probe = vulkan_probe();
+                if probe.usable() {
+                    (
+                        BackendAvailability::RecordOnly,
+                        "Vulkan driver present; recording only; pixel compute execution pending",
+                    )
+                } else {
+                    (BackendAvailability::Unavailable, probe.note)
+                }
+            }
             Self::Software => (
                 BackendAvailability::Live,
                 "in-crate CPU oracle for the sharing pixel contract",

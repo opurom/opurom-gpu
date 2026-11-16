@@ -167,7 +167,7 @@ fps measurement.
 ## GPU effect kernels and byte-equality proof
 
 `opurom-render --commands` also emits optional effect commands with integer
-parameters for IR carrying the five visual effects. Effect-free streams stay
+parameters for IR carrying visual effects. Effect-free streams stay
 byte-identical to the plain display-list path. The eight effect command kinds
 are:
 
@@ -194,8 +194,9 @@ MSL kernels' integer arithmetic, so `raster --backend software` writes the bytes
 Metal reads back. `tests/software_effects.rs` pins the P6 digest of a display
 list carrying all eight effect kinds on any host, asserts Metal/software byte
 equality on macOS, and runs the cross-repo `cmp` proof against the independent
-renderer with no GPU involved: `PROOF software-96x64: cmp=identical bytes=18445
-digest=1dc0303be6e1b8b2` (the same bytes the Metal proof reports).
+renderer with no GPU involved: `PROOF software-96x160: cmp=identical bytes=46094
+digest=65af3c9ce38010e7` and `PROOF software-96x64: cmp=identical bytes=18445
+digest=a15fda43e86e4887` (the same bytes the Metal proof reports).
 
 `effect_gaussian_blur` is a sixth visual effect that improves shadow and backdrop
 quality: shadows blur with a Gaussian
@@ -208,28 +209,30 @@ Weights are exact integers (row `C(2r, 0..=2r)`, sum `2^(2r)`) packed into the
 read the same weights, clamp edges and round with `(sum + W/2)/W`, so the CPU
 reference path is byte-identical to the Metal readback (proved on macOS in
 `tests/gaussian.rs`). This is a GPU-side effect with an in-crate CPU oracle; it
-does not change the existing five-effect cross-repo fixture or any golden digest.
+does not change the cross-repo effect fixture's pinned digest.
 
 The committed effect fixture is
-`../opurom-render/tests/fixtures/effects.opuir.json` (all five effects).
+`../opurom-render/tests/fixtures/effects.opuir.json` (all six visual effects).
 `tests/effects.rs` runs both binaries and the system `cmp`:
 
 ```sh
 ../opurom-render/target/debug/opurom-render \
-  ../opurom-render/tests/fixtures/effects.opuir.json 96 64 cpu.ppm \
-  --commands fx.commands.json      # digest=feb2eaaf6ae4d2ef, dirty=1
+  ../opurom-render/tests/fixtures/effects.opuir.json 96 160 cpu.ppm \
+  --commands fx.commands.json      # digest=a8613c9c49ad8ffa, dirty=1
 ./target/debug/opurom-gpu raster fx.commands.json gpu.ppm
 cmp cpu.ppm gpu.ppm                 # exit 0, byte-identical
 ```
 
 Measured result (FNV-1a 64 of the PPM bytes, from the `PROOF` lines of
 `cargo test --offline --test effects -- --nocapture`): `cmp` exits 0, both PPMs
-are 18445 bytes, digest `1dc0303be6e1b8b2`. The same test also proves equality
-at `64 48` (9229 bytes, digest `6a6dcd0a237116bb`), and `tests/software_effects.rs`
-reports the same two digests for `raster --backend software`. This is a real
-comparison against the independent software renderer, not a self-comparison.
-If the sibling renderer binary or fixture is absent, the test prints a clear
-`SKIP` message and claims no success.
+are 46094 bytes, digest `65af3c9ce38010e7` — the committed frame digest the
+renderer pins in `effects.digest.txt`. A shorter `96x64` viewport clips the
+local effect nodes (9227 px), so only the whole-frame passes emit there: 18445
+bytes, digest `a15fda43e86e4887`; `tests/software_effects.rs` reports the same
+two digests for `raster --backend software`, so renderer, Metal and the software
+backend agree byte for byte. This is a real comparison against the independent
+software renderer, not a self-comparison. If the sibling renderer binary or
+fixture is absent, the test prints a clear `SKIP` message and claims no success.
 
 The `raster` CLI itself is compute-only. Drawable presentation is reached
 through `opurom-platform`; there is still no GPU text
@@ -240,14 +243,25 @@ commit-to-completion latency. Non-macOS hosts return the documented
 
 ## Headless Vulkan command recorder
 
-`src/vulkan.rs` adds a real, headless-testable Vulkan backend. It is **not a
-stub and not a driver**: there is no `dlopen` of a Vulkan loader, no
-`VkInstance`, no queue submission, and no new crate dependency. It is a
-deterministic command-recording / translation layer that maps the same
+`src/vulkan.rs` adds a real, headless-testable Vulkan recorder. It is **not a
+driver**: it does no queue submission and pulls in no new crate dependency. It
+is a deterministic command-recording / translation layer that maps the same
 validated, packed display list Metal uploads into a typed Vulkan-style command
-stream, with integer-only validation and byte-deterministic encoding. This is
-honest about the host: `Backend::available()` reports Vulkan as
-**record-only** everywhere (no driver is loaded headless).
+stream, with integer-only validation and byte-deterministic encoding.
+
+`src/vulkan_loader.rs` is the honest driver probe: it loads the loader with
+`dlopen`/`dlsym` (the house runtime-load pattern, no link-time framework), then
+creates a real `VkInstance`, enumerates physical devices, picks a discrete GPU
+when present, checks the `shaderInt64` feature gate and creates a device with
+one compute queue. `Backend::available()` drives the reported state from that
+probe: a host with a driver reports Vulkan as **record-only** while the SPIR-V
+pixel compute pipeline is pending, and every other host reports
+**unavailable** with the exact reason (no loader, no device, no compute queue,
+missing `shaderInt64`). `backends` prints the probed device name, API/driver
+version and the gate results on a host that has one. The recorded stream is the
+transport contract and stays byte-identical, unchanged by the probe; execution
+is a separate compute raster that lands with the pixel pipeline, so the
+recorded stream is never claimed to be the execution path.
 
 Typed commands (`VkCommand`), matching the display-list primitives:
 
@@ -415,8 +429,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **76 tests**
-(42 unit tests and thirty-four integration tests, ten of which are the headless
+that no fake success occurs. On macOS, `cargo test --offline` runs **78 tests**
+(42 unit tests and thirty-six integration tests, ten of which are the headless
 Vulkan recorder proofs), including the cross-repo `cmp` proofs in
 `tests/display.rs`, `tests/effects.rs` and `tests/software_effects.rs` and the
 Metal/CPU equality proof for a mixed stream containing particles; GPU execution
@@ -432,9 +446,11 @@ one queried. The dispatch path, the readback equality proof and the on-screen pr
 comparison are the verified properties of this backend.
 No Metal API call in this backend is substituted with a software stub. The only
 software implementations are the explicitly separate CPU parsing/oracle path
-behind `--backend software` and the headless Vulkan command *recorder*
-(record-only, no driver), while `raster` defaults to the Metal dispatch on macOS
-and the presentation dylib always blits the compute buffer into a real drawable.
+behind `--backend software` and the headless Vulkan command *recorder*, while
+`raster` defaults to the Metal dispatch on macOS and the presentation dylib
+always blits the compute buffer into a real drawable. The Vulkan loader probe
+(`vulkan_loader.rs`) loads a driver at runtime where one exists; recording never
+submits to it, and pixel execution on Vulkan is pending.
 
 ## API notes
 
