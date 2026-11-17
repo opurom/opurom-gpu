@@ -17,6 +17,7 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod coverage_key;
 mod display;
 #[cfg(target_os = "macos")]
 mod metal;
