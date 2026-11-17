@@ -83,12 +83,14 @@ const RASTER_KERNEL_SOURCE: &str = r#"
 using namespace metal;
 
 constant long COORD_BIAS = 1073741824L;
-constant uint COMMAND_WORDS = 16u;
+constant uint COMMAND_WORDS = 24u;
 constant uint KIND_SOLID = 0u;
 constant uint KIND_ROUNDED = 1u;
 constant uint KIND_GRADIENT = 2u;
 constant uint KIND_GRADIENT_H = 3u;
 constant uint KIND_PARTICLES = 4u;
+constant uint KIND_ROUND_RECT_PER_CORNER = 5u;
+constant long RADIUS_CLAMP_GPU = 32768L;
 
 static inline uchar4 unpack_rgba(uint packed) {
     return uchar4(
@@ -132,6 +134,37 @@ static inline bool outside_round(long rx, long ry, long rw, long rh, long rad, l
     const long dy = y - ry;
     const long cy = (dy < rad) ? (cr - dy) : ((dy >= rh - rad) ? (dy - (rh - rad)) : -1L);
     return cx >= 0 && cy >= 0 && cx * cx + cy * cy > limit;
+}
+
+// Per-corner binary containment, mirroring the renderer's round_rect_contains.
+// Radii are raw int32 words, clamped before the cross-multiplied ellipse test
+// so every product stays inside int64.
+static inline long clamp_corner_radius(long v) {
+    if (v < 0L) return 0L;
+    if (v > RADIUS_CLAMP_GPU) return RADIUS_CLAMP_GPU;
+    return v;
+}
+
+static inline bool corner_contains_gpu(long px, long py, long cx, long cy, long dx, long dy, long rx, long ry) {
+    rx = clamp_corner_radius(rx);
+    ry = clamp_corner_radius(ry);
+    if (rx == 0L || ry == 0L) return true;
+    const long qx = rx - (cx - px) * dx;
+    const long qy = ry - (cy - py) * dy;
+    if (qx <= 0L || qy <= 0L) return true;
+    const long a = qx * ry;
+    const long b = qy * rx;
+    const long rr = rx * ry;
+    return a * a + b * b <= rr * rr;
+}
+
+static inline bool outside_round_corners(long rx, long ry, long rw, long rh, long x, long y,
+                                         long r0x, long r0y, long r1x, long r1y,
+                                         long r2x, long r2y, long r3x, long r3y) {
+    return !(corner_contains_gpu(x, y, rx, ry, -1L, -1L, r0x, r0y)
+          && corner_contains_gpu(x, y, rx + rw, ry, 1L, -1L, r1x, r1y)
+          && corner_contains_gpu(x, y, rx, ry + rh, -1L, 1L, r2x, r2y)
+          && corner_contains_gpu(x, y, rx + rw, ry + rh, 1L, 1L, r3x, r3y));
 }
 
 static inline bool inside_shape(long rx, long ry, long rw, long rh, long rad, long x, long y) {
@@ -287,6 +320,19 @@ kernel void raster_batch(
                 const long dx = px - cx;
                 const long dy = py - cy;
                 if (dx * dx + dy * dy <= limit) color = blend_px(color, dot);
+            }
+        } else if (kind == KIND_ROUND_RECT_PER_CORNER) {
+            const long r0x = long(int(cmds[base + 11u]));
+            const long r0y = long(int(cmds[base + 12u]));
+            const long r1x = long(int(cmds[base + 13u]));
+            const long r1y = long(int(cmds[base + 14u]));
+            const long r2x = long(int(cmds[base + 15u]));
+            const long r2y = long(int(cmds[base + 16u]));
+            const long r3x = long(int(cmds[base + 17u]));
+            const long r3y = long(int(cmds[base + 18u]));
+            if (!outside_round_corners(rx, ry, rw, rh, px, py,
+                                       r0x, r0y, r1x, r1y, r2x, r2y, r3x, r3y)) {
+                color = blend_px(color, unpack_rgba(cmds[base + 10u]));
             }
         } else if (kind == KIND_SOLID || kind == KIND_ROUNDED) {
             color = blend_px(color, unpack_rgba(cmds[base + 10u]));

@@ -9,12 +9,14 @@ layout(set = 0, binding = 4) buffer CommandsBlock { uint commands[]; };
 layout(push_constant) uniform Params { uint p[28]; };
 
 const uint COORD_BIAS = 1073741824u;
-const uint COMMAND_WORDS = 16u;
+const uint COMMAND_WORDS = 24u;
 const uint KIND_SOLID = 0u;
 const uint KIND_ROUNDED = 1u;
 const uint KIND_GRADIENT = 2u;
 const uint KIND_GRADIENT_H = 3u;
 const uint KIND_PARTICLES = 4u;
+const uint KIND_ROUND_RECT_PER_CORNER = 5u;
+const int64_t RADIUS_CLAMP_GPU = 32768L;
 
 uvec4 unpack_rgba(uint packed) {
     return uvec4(packed & 255u, (packed >> 8u) & 255u, (packed >> 16u) & 255u, (packed >> 24u) & 255u);
@@ -57,6 +59,39 @@ bool outside_round(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, 
     int64_t dy = y - ry;
     int64_t cy = (dy < rad) ? (cr - dy) : ((dy >= rh - rad) ? (dy - (rh - rad)) : -1L);
     return cx >= int64_t(0) && cy >= int64_t(0) && cx * cx + cy * cy > limit;
+}
+
+// Per-corner binary containment, mirroring the renderer's round_rect_contains.
+// Radii are raw int32 words, clamped before the cross-multiplied ellipse test
+// so every product stays inside int64.
+int64_t clamp_corner_radius(int64_t v) {
+    if (v < int64_t(0)) return int64_t(0);
+    if (v > RADIUS_CLAMP_GPU) return RADIUS_CLAMP_GPU;
+    return v;
+}
+
+bool corner_contains_gpu(int64_t px, int64_t py, int64_t cx, int64_t cy,
+                         int64_t dx, int64_t dy, int64_t rx, int64_t ry) {
+    rx = clamp_corner_radius(rx);
+    ry = clamp_corner_radius(ry);
+    if (rx == int64_t(0) || ry == int64_t(0)) return true;
+    int64_t qx = rx - (cx - px) * dx;
+    int64_t qy = ry - (cy - py) * dy;
+    if (qx <= int64_t(0) || qy <= int64_t(0)) return true;
+    int64_t a = qx * ry;
+    int64_t b = qy * rx;
+    int64_t rr = rx * ry;
+    return a * a + b * b <= rr * rr;
+}
+
+bool outside_round_corners(int64_t rx, int64_t ry, int64_t rw, int64_t rh,
+                           int64_t x, int64_t y, int64_t r0x, int64_t r0y,
+                           int64_t r1x, int64_t r1y, int64_t r2x, int64_t r2y,
+                           int64_t r3x, int64_t r3y) {
+    return !(corner_contains_gpu(x, y, rx, ry, -1L, -1L, r0x, r0y)
+          && corner_contains_gpu(x, y, rx + rw, ry, 1L, -1L, r1x, r1y)
+          && corner_contains_gpu(x, y, rx, ry + rh, -1L, 1L, r2x, r2y)
+          && corner_contains_gpu(x, y, rx + rw, ry + rh, 1L, 1L, r3x, r3y));
 }
 
 // Regular-command blend: integer /255 without half-up rounding.
@@ -132,6 +167,19 @@ void main() {
                 const int64_t dx = px - cx;
                 const int64_t dy = py - cy;
                 if (dx * dx + dy * dy <= limit) color = blend_px(color, dot);
+            }
+        } else if (kind == KIND_ROUND_RECT_PER_CORNER) {
+            const int64_t r0x = int64_t(int(commands[base + 11u]));
+            const int64_t r0y = int64_t(int(commands[base + 12u]));
+            const int64_t r1x = int64_t(int(commands[base + 13u]));
+            const int64_t r1y = int64_t(int(commands[base + 14u]));
+            const int64_t r2x = int64_t(int(commands[base + 15u]));
+            const int64_t r2y = int64_t(int(commands[base + 16u]));
+            const int64_t r3x = int64_t(int(commands[base + 17u]));
+            const int64_t r3y = int64_t(int(commands[base + 18u]));
+            if (!outside_round_corners(rx, ry, rw, rh, px, py,
+                                       r0x, r0y, r1x, r1y, r2x, r2y, r3x, r3y)) {
+                color = blend_px(color, unpack_rgba(commands[base + 10u]));
             }
         } else if (kind == KIND_SOLID || kind == KIND_ROUNDED) {
             color = blend_px(color, unpack_rgba(commands[base + 10u]));

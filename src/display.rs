@@ -10,10 +10,14 @@ use crate::{GpuError, MAX_DIMENSION};
 use std::str;
 
 pub const MAX_COMMANDS: usize = 1_000_000;
-pub const COMMAND_WORDS: usize = 16;
+pub const COMMAND_WORDS: usize = 24;
 /// Signed coordinates are encoded as `value + COORD_BIAS` for MSL's `int`.
 pub const COORD_BIAS: i64 = 1 << 30;
 pub const COORD_LIMIT: i64 = 500_000_000;
+/// Upper bound for per-corner radii so the cross-multiplied ellipse test stays
+/// inside int64: `(qx*ry)^2 + (qy*rx)^2 <= (rx*ry)^2` with `qx<=rx`, `qy<=ry`
+/// gives each square at most `(2^15)^4 = 2^60`, sum at most `2^61 < 2^63`.
+pub const RADIUS_CLAMP_GPU: i64 = 1 << 15;
 
 /// Effect parameter bounds, shared with opurom-render's effect schema.
 pub const EFFECT_MAX_RADIUS: i64 = 32;
@@ -54,6 +58,7 @@ pub(crate) const ROUNDED: u32 = 1;
 pub(crate) const GRADIENT: u32 = 2;
 pub(crate) const GRADIENT_HORIZONTAL: u32 = 3;
 pub(crate) const PARTICLES: u32 = 4;
+pub(crate) const ROUND_RECT_PER_CORNER: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -66,6 +71,14 @@ pub enum Command {
         rect: [i64; 4],
         clip: [i64; 4],
         radius: i64,
+        color: [u8; 4],
+    },
+    /// Four independent elliptical radii in fixed top-left, top-right,
+    /// bottom-left, bottom-right order. Radii arrive already normalized.
+    RoundRectPerCorner {
+        rect: [i64; 4],
+        clip: [i64; 4],
+        radii: [[i64; 2]; 4],
         color: [u8; 4],
     },
     Gradient {
@@ -166,6 +179,7 @@ impl Command {
             | Command::GradientHorizontal {
                 rect, clip, radius, ..
             } => (rect, clip, radius),
+            Command::RoundRectPerCorner { rect, clip, .. } => (rect, clip, 0),
             Command::Particles { rect, clip, .. } => (rect, clip, 0),
             _ => return None,
         })
@@ -187,8 +201,15 @@ impl Command {
         if radius > 0 && outside_round(rect, radius, x, y) {
             return None;
         }
+        if let Command::RoundRectPerCorner { radii, .. } = *self {
+            if outside_round_corners(rect, radii, x, y) {
+                return None;
+            }
+        }
         match *self {
-            Command::Solid { color, .. } | Command::Rounded { color, .. } => Some(color),
+            Command::Solid { color, .. }
+            | Command::Rounded { color, .. }
+            | Command::RoundRectPerCorner { color, .. } => Some(color),
             Command::Gradient {
                 rect,
                 top,
@@ -266,6 +287,7 @@ impl Command {
         packed[0] = match self {
             Command::Solid { .. } => SOLID,
             Command::Rounded { .. } => ROUNDED,
+            Command::RoundRectPerCorner { .. } => ROUND_RECT_PER_CORNER,
             Command::Gradient { .. } => GRADIENT,
             Command::GradientHorizontal { .. } => GRADIENT_HORIZONTAL,
             Command::Particles { .. } => PARTICLES,
@@ -281,6 +303,14 @@ impl Command {
         match *self {
             Command::Solid { color, .. } | Command::Rounded { color, .. } => {
                 packed[10] = pack_rgba(color);
+            }
+            Command::RoundRectPerCorner { radii, color, .. } => {
+                packed[10] = pack_rgba(color);
+                for (corner, pair) in radii.iter().enumerate() {
+                    for (axis, value) in pair.iter().enumerate() {
+                        packed[11 + corner * 2 + axis] = encode_raw(*value, "corner radius")?;
+                    }
+                }
             }
             Command::Gradient {
                 top, bottom, alpha, ..
@@ -456,6 +486,9 @@ impl DisplayList {
             if let Some((rect, clip, radius)) = command.geometry() {
                 validate_geometry(rect, clip, radius, self.width, self.height)?;
                 validate_gradient_stops(command)?;
+                if let Command::RoundRectPerCorner { radii, .. } = command {
+                    validate_corner_radii(radii)?;
+                }
             } else {
                 validate_effect(command, self.width, self.height)?;
             }
@@ -541,6 +574,17 @@ fn encode_coord(value: i64, what: &str) -> Result<u32, GpuError> {
     Ok((value + COORD_BIAS) as u32)
 }
 
+/// Per-corner radii are raw signed int32 words: the shader converts them back
+/// to int64 and clamps to `RADIUS_CLAMP_GPU` before the containment test.
+fn encode_raw(value: i64, what: &str) -> Result<u32, GpuError> {
+    if !(-COORD_LIMIT..=COORD_LIMIT).contains(&value) {
+        return Err(GpuError::InvalidDisplayList(format!(
+            "{what} {value} exceeds the integer range"
+        )));
+    }
+    Ok(value as u32)
+}
+
 fn mix_channel(from: u8, to: u8, t: i64) -> u8 {
     let value = ((i64::from(to) - i64::from(from)) * t + UNIT / 2) / UNIT + i64::from(from);
     value.clamp(0, 255) as u8
@@ -569,6 +613,35 @@ fn outside_round(rect: [i64; 4], rad: i64, x: i64, y: i64) -> bool {
         -1
     };
     cx >= 0 && cy >= 0 && cx * cx + cy * cy > limit
+}
+
+/// Binary per-corner containment: mirrors the renderer's `round_rect_contains`
+/// with four independent elliptical corners. Radii are clamped before the
+/// cross-multiplied test so every product stays inside int64.
+fn outside_round_corners(rect: [i64; 4], radii: [[i64; 2]; 4], x: i64, y: i64) -> bool {
+    let corners = [
+        (rect[0], rect[1], -1, -1),
+        (rect[0] + rect[2], rect[1], 1, -1),
+        (rect[0], rect[1] + rect[3], -1, 1),
+        (rect[0] + rect[2], rect[1] + rect[3], 1, 1),
+    ];
+    for (index, (cx, cy, dx, dy)) in corners.iter().enumerate() {
+        let rx = radii[index][0].clamp(0, RADIUS_CLAMP_GPU);
+        let ry = radii[index][1].clamp(0, RADIUS_CLAMP_GPU);
+        if rx == 0 || ry == 0 {
+            continue;
+        }
+        let qx = rx - (cx - x) * dx;
+        let qy = ry - (cy - y) * dy;
+        if qx <= 0 || qy <= 0 {
+            continue;
+        }
+        let (a, b, rr) = (qx * ry, qy * rx, rx * ry);
+        if a * a + b * b > rr * rr {
+            return true;
+        }
+    }
+    false
 }
 
 fn blend(pixel: &mut [u8], src: [u8; 4]) {
@@ -1205,6 +1278,26 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
+    /// Four fixed `[x, y]` corner pairs in top-left, top-right, bottom-left,
+    /// bottom-right order. IR key order is irrelevant: the renderer maps by
+    /// name before emitting this array.
+    fn corner_pairs(&mut self) -> Result<[[i64; 2]; 4], GpuError> {
+        self.expect(b'[', "in radii")?;
+        let mut radii = [[0i64; 2]; 4];
+        for (index, pair) in radii.iter_mut().enumerate() {
+            if index > 0 {
+                self.expect(b',', "in radii")?;
+            }
+            self.expect(b'[', &format!("in radii[{index}]"))?;
+            pair[0] = self.integer()?;
+            self.expect(b',', &format!("in radii[{index}]"))?;
+            pair[1] = self.integer()?;
+            self.expect(b']', &format!("after radii[{index}]"))?;
+        }
+        self.expect(b']', "after radii")?;
+        Ok(radii)
+    }
+
     fn u8_array(&mut self, what: &str) -> Result<[u8; 4], GpuError> {
         self.expect(b'[', &format!("in {what}"))?;
         let mut values = [0u8; 4];
@@ -1262,6 +1355,21 @@ fn validate_geometry(
         return Err(GpuError::InvalidDisplayList(
             "clip extends outside the viewport".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Per-corner radii must stay inside the protocol bound; the renderer
+/// normalizes them, this side only rejects values the int64 test cannot hold.
+fn validate_corner_radii(radii: &[[i64; 2]; 4]) -> Result<(), GpuError> {
+    for pair in radii {
+        for value in pair {
+            if !(-RADIUS_CLAMP_GPU..=RADIUS_CLAMP_GPU).contains(value) {
+                return Err(GpuError::InvalidDisplayList(format!(
+                    "corner radius {value} exceeds the protocol bound {RADIUS_CLAMP_GPU}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1645,6 +1753,21 @@ fn parse_regular_command(
                 color,
             }
         }
+        "round_rect_per_corner" => {
+            parser.expect(b',', "after clip")?;
+            parser.key("radii")?;
+            let radii = parser.corner_pairs()?;
+            parser.expect(b',', "after radii")?;
+            parser.key("color")?;
+            let color = parser.u8_array("color")?;
+            parser.expect(b'}', "after round_rect_per_corner command")?;
+            Command::RoundRectPerCorner {
+                rect,
+                clip,
+                radii,
+                color,
+            }
+        }
         "gradient" | "gradient_horizontal" => {
             parser.expect(b',', "after clip")?;
             parser.key("radius")?;
@@ -1709,6 +1832,9 @@ fn parse_regular_command(
     };
     let (_, _, radius) = command.geometry().expect("regular command");
     validate_geometry(rect, clip, radius, width, height)?;
+    if let Command::RoundRectPerCorner { radii, .. } = &command {
+        validate_corner_radii(radii)?;
+    }
     if let Command::Particles {
         count,
         seed,
