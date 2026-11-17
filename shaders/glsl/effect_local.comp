@@ -167,6 +167,16 @@ void main() {
             if (a > 255L) a = 255L;
             out_color = blend_fx(here, color, a);
         }
+    } else if (kind == 4L) {
+        // Material elevation layer: p[7] is the raw layer alpha byte, p[8] the
+        // blur sigma and p[11] the node radius used to skip the node body.
+        if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
+            !inside_shape(rx, ry, rw, rh, rad, x, y)) {
+            const int64_t cov = soft_coverage(width, bx, by, bw, bh, r, x, y);
+            int64_t a = (int64_t(p[7]) * cov + 127L) / 255L;
+            if (a > 255L) a = 255L;
+            out_color = blend_fx(here, color, a);
+        }
     }
     secondary[tid] = out_color.x | (out_color.y << 8u) | (out_color.z << 16u) | (out_color.w << 24u);
 }

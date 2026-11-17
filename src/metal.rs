@@ -454,6 +454,16 @@ kernel void effect_local(
             if (a > 255) a = 255;
             out = blend_fx(here, color, a);
         }
+    } else if (kind == 4L) {
+        // Material elevation layer: p[7] is the raw layer alpha byte, p[8] the
+        // blur sigma and p[11] the node radius used to skip the node body.
+        if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
+            !inside_shape(rx, ry, rw, rh, rad, x, y)) {
+            const long cov = soft_coverage(mask, w, bx, by, bw, bh, r, x, y);
+            long a = (long(p[7]) * cov + 127L) / 255L;
+            if (a > 255) a = 255;
+            out = blend_fx(here, color, a);
+        }
     }
     dst[off] = out.x;
     dst[off + 1L] = out.y;

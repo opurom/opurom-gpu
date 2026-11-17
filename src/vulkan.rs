@@ -139,6 +139,7 @@ pub enum VkEffect {
     Backdrop,
     Mask,
     Shadow,
+    Elevation,
     Glow,
     Glass,
     Liquid,
@@ -154,6 +155,7 @@ impl VkEffect {
             Self::Backdrop => 0,
             Self::Mask => 1,
             Self::Shadow => 2,
+            Self::Elevation => 10,
             Self::Glow => 3,
             Self::Glass => 4,
             Self::Liquid => 5,
@@ -176,6 +178,7 @@ impl VkEffect {
             7 => Self::BlurVertical,
             8 => Self::GaussianHorizontal,
             9 => Self::GaussianVertical,
+            10 => Self::Elevation,
             _ => return None,
         })
     }
@@ -806,7 +809,11 @@ fn dispatch_kernel(effect: VkEffect) -> u32 {
     match effect {
         VkEffect::Backdrop => KERNEL_SNAPSHOT,
         VkEffect::Mask => KERNEL_MASK,
-        VkEffect::Shadow | VkEffect::Glow | VkEffect::Glass | VkEffect::Liquid => KERNEL_EFFECT,
+        VkEffect::Shadow
+        | VkEffect::Elevation
+        | VkEffect::Glow
+        | VkEffect::Glass
+        | VkEffect::Liquid => KERNEL_EFFECT,
         VkEffect::BlurHorizontal => KERNEL_BLUR_H,
         VkEffect::BlurVertical => KERNEL_BLUR_V,
         VkEffect::GaussianHorizontal => KERNEL_GAUSSIAN_H,
@@ -823,6 +830,7 @@ fn effect_from_pass(pass: &Pass) -> Result<VkEffect, VkError> {
             1 => VkEffect::Glow,
             2 => VkEffect::Glass,
             3 => VkEffect::Liquid,
+            4 => VkEffect::Elevation,
             other => {
                 return Err(VkError::MalformedDisplayList(format!(
                     "unknown local effect kind {other}"

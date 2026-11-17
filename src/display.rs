@@ -125,6 +125,15 @@ pub enum Command {
         alpha: i64,
         color: [u8; 4],
     },
+    /// Per-node M3 material elevation. `level` selects the shared three-layer
+    /// table; the GPU expands it into one mask + one blur pass per layer.
+    EffectElevation {
+        rect: [i64; 4],
+        clip: [i64; 4],
+        radius: i64,
+        level: i64,
+        color: [u8; 4],
+    },
     EffectGlow {
         bounds: [i64; 4],
         radius: i64,
@@ -356,12 +365,128 @@ fn put4(params: &mut [u32; PARAM_WORDS], offset: usize, values: [i64; 4]) -> Res
     Ok(())
 }
 
+/// One material elevation layer: `(dx, dy, blur, spread, alpha byte)`.
+pub type ElevationLayer = (i64, i64, i64, i64, u8);
+
+/// Shared M3 elevation table, `[ambient, penumbra, umbra]` far-to-near.
+/// Levels 5 and 7+ are absent by spec; the renderer only records 1/2/3/4/6.
+pub const ELEVATION_TABLE: [Option<[ElevationLayer; 3]>; 7] = [
+    None,
+    Some([(0, 1, 3, 0, 31), (0, 1, 1, 0, 36), (0, 2, 1, -1, 51)]),
+    Some([(0, 1, 5, 0, 31), (0, 2, 2, 0, 36), (0, 3, 1, -2, 51)]),
+    Some([(0, 1, 8, 0, 31), (0, 3, 4, 0, 36), (0, 3, 3, -2, 51)]),
+    Some([(0, 1, 10, 0, 31), (0, 4, 5, 0, 36), (0, 2, 4, -1, 51)]),
+    None,
+    Some([(0, 1, 18, 0, 31), (0, 6, 10, 0, 36), (0, 3, 5, -1, 51)]),
+];
+
+fn elevation_layers(level: i64) -> Option<[ElevationLayer; 3]> {
+    ELEVATION_TABLE.get(level as usize).copied().flatten()
+}
+
+/// Flutter `convertRadiusToSigma`: `round(blur * 0.57735 + 0.5)`, written with
+/// the same integer floor the renderer uses.
+fn elevation_sigma(blur: i64) -> i64 {
+    if blur > 0 {
+        (blur * 57735) / 100000 + 1
+    } else {
+        0
+    }
+}
+
+/// Layer box: the node rect expanded by `spread` (negative shrinks), offset.
+fn elevation_box(rect: [i64; 4], dx: i64, dy: i64, spread: i64) -> [i64; 4] {
+    [
+        rect[0].saturating_add(dx).saturating_sub(spread),
+        rect[1].saturating_add(dy).saturating_sub(spread),
+        rect[2].saturating_add(spread.saturating_mul(2)).max(0),
+        rect[3].saturating_add(spread.saturating_mul(2)).max(0),
+    ]
+}
+
+/// Clip the padded layer box to the viewport and the command clip.
+fn elevation_bounds(
+    width: u32,
+    height: u32,
+    clip: [i64; 4],
+    box_r: [i64; 4],
+    pad: i64,
+) -> [i64; 4] {
+    let x0 = box_r[0].saturating_sub(pad).max(clip[0]).max(0);
+    let y0 = box_r[1].saturating_sub(pad).max(clip[1]).max(0);
+    let x1 = box_r[0]
+        .saturating_add(box_r[2].max(0))
+        .saturating_add(pad)
+        .min(clip[0].saturating_add(clip[2]))
+        .min(i64::from(width));
+    let y1 = box_r[1]
+        .saturating_add(box_r[3].max(0))
+        .saturating_add(pad)
+        .min(clip[1].saturating_add(clip[3]))
+        .min(i64::from(height));
+    [x0, y0, (x1 - x0).max(0), (y1 - y0).max(0)]
+}
+
 /// One or two Metal passes for a single effect command.
 fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>, GpuError> {
     let one = |kernel, params| Ok(vec![Pass { kernel, params }]);
     let mut p = base_params(width, height);
     match *command {
         Command::EffectBackdrop => one(KERNEL_SNAPSHOT, p),
+        Command::EffectElevation {
+            rect,
+            clip,
+            radius,
+            level,
+            color,
+        } => {
+            let Some(layers) = elevation_layers(level) else {
+                return Err(GpuError::InvalidDisplayList(format!(
+                    "unknown elevation level {level}"
+                )));
+            };
+            let mut passes = Vec::with_capacity(6);
+            for (dx, dy, blur, spread, alpha) in layers {
+                let box_r = elevation_box(rect, dx, dy, spread);
+                if box_r[2] <= 0 || box_r[3] <= 0 {
+                    continue;
+                }
+                let sigma = elevation_sigma(blur);
+                let pad = (sigma * 3).max(1);
+                let bounds = elevation_bounds(width, height, clip, box_r, pad);
+                if bounds[2] <= 0 || bounds[3] <= 0 {
+                    continue;
+                }
+                let lrad = radius
+                    .saturating_add(spread.max(0))
+                    .max(0)
+                    .min(box_r[2].min(box_r[3]) / 2);
+                let mut mask = base_params(width, height);
+                mask[11] = lrad as u32;
+                mask[25] = 1;
+                put4(&mut mask, 13, bounds)?;
+                put4(&mut mask, 17, box_r)?;
+                put4(&mut mask, 21, clip)?;
+                passes.push(Pass {
+                    kernel: KERNEL_MASK,
+                    params: mask,
+                });
+                let mut local = base_params(width, height);
+                local[2] = 4;
+                local[3] = pack_rgba(color);
+                local[7] = u32::from(alpha);
+                local[8] = sigma as u32;
+                local[11] = radius as u32;
+                put4(&mut local, 13, bounds)?;
+                put4(&mut local, 17, rect)?;
+                put4(&mut local, 21, clip)?;
+                passes.push(Pass {
+                    kernel: KERNEL_EFFECT,
+                    params: local,
+                });
+            }
+            Ok(passes)
+        }
         Command::EffectGaussianBlur { radius } => {
             let (sum, weights) = gaussian_weights(radius);
             p[2] = radius as u32;
@@ -979,6 +1104,50 @@ fn effect_local(
     }
 }
 
+/// One material-elevation layer: blur the spread-box mask, then blend the dark
+/// layer outside the node body. Mirrors the MSL `effect_local` kind 4 branch.
+fn effect_local_elevation(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    mask: &[u8],
+    bounds: [i64; 4],
+    node_rect: [i64; 4],
+    node_radius: i64,
+    sigma: i64,
+    alpha: i64,
+    color: [u8; 4],
+) {
+    let (w, h) = (i64::from(width), i64::from(height));
+    let color = [color[0], color[1], color[2]];
+    for y in 0..h {
+        for x in 0..w {
+            let (ix, iy) = (x - bounds[0], y - bounds[1]);
+            if ix < 0 || iy < 0 || ix >= bounds[2] || iy >= bounds[3] {
+                continue;
+            }
+            if inside_shape(node_rect, node_radius, x, y) {
+                continue;
+            }
+            let coverage = soft_coverage(mask, width, bounds, sigma, x, y);
+            let mut a = (alpha * coverage + 127) / 255;
+            if a > 255 {
+                a = 255;
+            }
+            let offset = ((y * w + x) * 4) as usize;
+            let out = blend_fx(
+                [frame[offset], frame[offset + 1], frame[offset + 2]],
+                color,
+                a,
+            );
+            frame[offset] = out[0];
+            frame[offset + 1] = out[1];
+            frame[offset + 2] = out[2];
+            frame[offset + 3] = 255;
+        }
+    }
+}
+
 /// One separable box-blur pass over the whole frame: the horizontal or the
 /// vertical half of the `effect_blur` pair.
 fn blur_axis(frame: &[u8], width: u32, height: u32, radius: i64, horizontal: bool) -> Vec<u8> {
@@ -1049,6 +1218,59 @@ pub fn render_cpu_passes(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
                 shape_radius,
                 shape,
             ),
+            Command::EffectElevation {
+                rect,
+                clip,
+                radius,
+                level,
+                color,
+            } => {
+                let Some(layers) = elevation_layers(level) else {
+                    return Err(GpuError::InvalidDisplayList(format!(
+                        "unknown elevation level {level}"
+                    )));
+                };
+                for (dx, dy, blur, spread, alpha) in layers {
+                    let box_r = elevation_box(rect, dx, dy, spread);
+                    if box_r[2] <= 0 || box_r[3] <= 0 {
+                        continue;
+                    }
+                    let sigma = elevation_sigma(blur);
+                    let pad = (sigma * 3).max(1);
+                    let bounds = elevation_bounds(list.width, list.height, clip, box_r, pad);
+                    if bounds[2] <= 0 || bounds[3] <= 0 {
+                        continue;
+                    }
+                    let lrad = radius
+                        .saturating_add(spread.max(0))
+                        .max(0)
+                        .min(box_r[2].min(box_r[3]) / 2);
+                    build_mask(
+                        &frame,
+                        &backdrop,
+                        &mut mask,
+                        list.width,
+                        list.height,
+                        box_r,
+                        clip,
+                        bounds,
+                        lrad,
+                        true,
+                    );
+                    effect_local_elevation(
+                        &mut frame,
+                        list.width,
+                        list.height,
+                        &mask,
+                        bounds,
+                        rect,
+                        radius,
+                        sigma,
+                        i64::from(alpha),
+                        color,
+                    );
+                }
+            }
             Command::EffectShadow { .. }
             | Command::EffectGlow { .. }
             | Command::EffectGlass { .. }
@@ -1481,6 +1703,27 @@ pub(crate) fn validate_effect(command: &Command, width: u32, height: u32) -> Res
     let mut has_geometry = false;
     match *command {
         Command::EffectBackdrop => return Ok(()),
+        Command::EffectElevation {
+            rect: r,
+            clip: c,
+            radius: rad,
+            level: l,
+            color: col,
+        } => {
+            if !matches!(l, 1 | 2 | 3 | 4 | 6) {
+                return Err(bad_effect(format!(
+                    "elevation level {l} must be one of 1,2,3,4,6"
+                )));
+            }
+            effect_coords(r, "rect")?;
+            if r[2] < 0 || r[3] < 0 {
+                return Err(bad_effect("elevation rect must have non-negative size"));
+            }
+            effect_normalized(c, "clip", width, height)?;
+            effect_range(rad, 0, r[2].min(r[3]).max(0) / 2, "radius")?;
+            effect_color(col)?;
+            return Ok(());
+        }
         Command::EffectGaussianBlur { radius } => {
             return effect_range(
                 radius,
@@ -1657,6 +1900,21 @@ fn parse_effect_command(
                 dx,
                 dy,
                 alpha,
+                color,
+            }
+        }
+        "effect_elevation" => {
+            let rect = field_rect(parser, "rect")?;
+            let clip = field_rect(parser, "clip")?;
+            let radius = field_i64(parser, "radius")?;
+            let level = field_i64(parser, "level")?;
+            let color = field_color(parser, "color")?;
+            parser.expect(b'}', "after effect_elevation")?;
+            Command::EffectElevation {
+                rect,
+                clip,
+                radius,
+                level,
                 color,
             }
         }

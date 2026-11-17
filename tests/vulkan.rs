@@ -583,6 +583,16 @@ const EXEC_FIXTURE: &str = r#"{"version":1,"width":32,"height":24,"background":[
 {"kind":"effect_gaussian_blur","radius":2}
 ]}"#;
 
+/// A display list carrying one material elevation layer group, used for the
+/// Vulkan/CPU byte-equality gate.
+const ELEVATION_EXEC_FIXTURE: &str = r#"{"version":1,"width":120,"height":100,"background":[247,248,250,255],"commands":[
+{"kind":"rounded","rect":[0,0,120,100],"clip":[0,0,120,100],"radius":4,"color":[216,220,228,255]},
+{"kind":"rounded","rect":[1,1,118,98],"clip":[0,0,120,100],"radius":3,"color":[255,255,255,255]},
+{"kind":"effect_elevation","rect":[8,8,60,40],"clip":[0,0,120,100],"radius":4,"level":2,"color":[0,0,0,255]},
+{"kind":"rounded","rect":[8,8,60,40],"clip":[0,0,120,100],"radius":4,"color":[216,220,228,255]},
+{"kind":"rounded","rect":[9,9,58,38],"clip":[0,0,120,100],"radius":3,"color":[16,32,48,255]}
+]}"#;
+
 fn vulkan_skip(message: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr().lock(), "SKIP: {message}");
@@ -612,6 +622,32 @@ fn vulkan_execute_matches_software_oracle() {
     assert_eq!(again, gpu, "repeated vulkan renders must be byte-identical");
     println!(
         "PROOF vulkan-execute: cmp=identical bytes={} digest={}",
+        cpu.len(),
+        opurom_gpu::digest_hex(&cpu)
+    );
+}
+
+/// The material elevation layers expand into mask and blur passes; the Vulkan
+/// dispatch must produce the same bytes as the software oracle.
+#[test]
+fn vulkan_elevation_matches_software_oracle() {
+    if !opurom_gpu::vulkan_probe().usable() {
+        vulkan_skip("no probed Vulkan compute device; execute gate is CI-verified on lavapipe");
+        return;
+    }
+    let list = parse_display_list(ELEVATION_EXEC_FIXTURE).expect("fixture must parse");
+    let cpu = Backend::Software
+        .run_ppm(&list)
+        .expect("software oracle must render");
+    let gpu = Backend::Vulkan
+        .run_ppm(&list)
+        .expect("vulkan must execute the elevation passes");
+    assert_eq!(
+        gpu, cpu,
+        "vulkan elevation compute must byte-match the software oracle"
+    );
+    println!(
+        "PROOF vulkan-elevation: cmp=identical bytes={} digest={}",
         cpu.len(),
         opurom_gpu::digest_hex(&cpu)
     );
