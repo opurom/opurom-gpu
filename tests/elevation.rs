@@ -174,12 +174,14 @@ fn the_command_carries_its_own_fields() {
             rect,
             clip,
             radius,
+            radii,
             level,
             color,
         } => {
             assert_eq!(*rect, [8, 8, 60, 40]);
             assert_eq!(*clip, [0, 0, 120, 100]);
             assert_eq!(*radius, 4);
+            assert!(radii.is_none(), "a uniform node omits the radii key");
             assert_eq!(*level, 2);
             assert_eq!(*color, [0, 0, 0, 255]);
         }
@@ -210,4 +212,54 @@ fn a_malformed_elevation_command_is_rejected() {
             "case {index}: {error:?}"
         );
     }
+}
+
+/// Real display list from `opurom-render` for an elliptical-corner node with
+/// elevation 3. The renderer CLI prints `digest=5ed3652cf57195a0` over these
+/// RGBA bytes and writes a PPM whose digest is `651998e4a4b761a8`.
+const REAL_CORNER_ELEVATION_COMMANDS: &str = r#"{"version":1,"width":160,"height":140,"background":[247,248,250,255],"commands":[
+{"kind":"rounded","rect":[0,0,160,140],"clip":[0,0,160,140],"radius":4,"color":[255,255,255,255]},
+{"kind":"rounded","rect":[1,1,158,138],"clip":[0,0,160,140],"radius":3,"color":[255,255,255,255]},
+{"kind":"effect_elevation","rect":[20,20,80,60],"clip":[0,0,160,140],"radius":0,"radii":[[40,10],[40,10],[40,10],[40,10]],"level":3,"color":[0,0,0,255]},
+{"kind":"round_rect_per_corner","rect":[20,20,80,60],"clip":[0,0,160,140],"radii":[[40,10],[40,10],[40,10],[40,10]],"color":[255,255,255,255]},
+{"kind":"round_rect_per_corner","rect":[21,21,78,58],"clip":[0,0,160,140],"radii":[[39,9],[39,9],[39,9],[39,9]],"color":[255,255,255,255]}
+]}"#;
+
+#[test]
+fn per_corner_elevation_matches_the_rendered_frame() {
+    let parsed =
+        parse_display_list(REAL_CORNER_ELEVATION_COMMANDS).expect("command JSON must parse");
+    let command = parsed
+        .commands
+        .iter()
+        .find(|command| matches!(command, Command::EffectElevation { .. }))
+        .expect("the list carries an elevation command");
+    match command {
+        Command::EffectElevation { radii, .. } => {
+            let expected = [[40, 10], [40, 10], [40, 10], [40, 10]];
+            assert_eq!(*radii, Some(expected), "TL,TR,BL,BR wire order");
+        }
+        other => panic!("unexpected command {other:?}"),
+    }
+    let pixels = render_cpu_passes(&parsed).expect("CPU oracle must render");
+    assert_eq!(digest_hex(&pixels), "5ed3652cf57195a0");
+    let ppm = opurom_gpu::ppm_bytes(160, 140, &pixels).expect("PPM must encode");
+    assert_eq!(digest_hex(&ppm), "651998e4a4b761a8");
+}
+
+#[test]
+fn per_corner_elevation_diffs_from_the_scalar_shadow() {
+    let corner = parse_display_list(REAL_CORNER_ELEVATION_COMMANDS).unwrap();
+    let scalar = REAL_CORNER_ELEVATION_COMMANDS.replace(
+        "\"radius\":0,\"radii\":[[40,10],[40,10],[40,10],[40,10]],\"level\":3",
+        "\"radius\":0,\"level\":3",
+    );
+    let scalar = parse_display_list(&scalar).unwrap();
+    let a = render_cpu_passes(&corner).unwrap();
+    let b = render_cpu_passes(&scalar).unwrap();
+    assert_ne!(
+        digest_hex(&a),
+        digest_hex(&b),
+        "the per-corner path must be authoritative"
+    );
 }

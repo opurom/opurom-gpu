@@ -29,6 +29,28 @@ bool inside_shape(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, i
     return !outside_round(rx, ry, rw, rh, rad, x, y);
 }
 
+// Cross-multiplied elliptical corner test, shared with the per-corner raster.
+bool corner_contains_gpu(int64_t px, int64_t py, int64_t cx, int64_t cy,
+                         int64_t dx, int64_t dy, int64_t rx, int64_t ry) {
+    if (rx <= int64_t(0) || ry <= int64_t(0)) return true;
+    int64_t qx = rx - (cx - px) * dx;
+    int64_t qy = ry - (cy - py) * dy;
+    if (qx <= int64_t(0) || qy <= int64_t(0)) return true;
+    int64_t a = qx * ry;
+    int64_t b = qy * rx;
+    int64_t rr = rx * ry;
+    return a * a + b * b <= rr * rr;
+}
+
+bool outside_round_corners(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t x, int64_t y,
+                           int64_t r0x, int64_t r0y, int64_t r1x, int64_t r1y,
+                           int64_t r2x, int64_t r2y, int64_t r3x, int64_t r3y) {
+    return !(corner_contains_gpu(x, y, rx, ry, -1L, -1L, r0x, r0y)
+          && corner_contains_gpu(x, y, rx + rw, ry, 1L, -1L, r1x, r1y)
+          && corner_contains_gpu(x, y, rx, ry + rh, -1L, 1L, r2x, r2y)
+          && corner_contains_gpu(x, y, rx + rw, ry + rh, 1L, 1L, r3x, r3y));
+}
+
 void main() {
     const uint tid = gl_GlobalInvocationID.x;
     const uint width = p[0];
@@ -42,11 +64,20 @@ void main() {
     const int64_t rx = dec(p[17]), ry = dec(p[18]), rw = dec(p[19]), rh = dec(p[20]);
     const int64_t cx = dec(p[21]), cy = dec(p[22]), cw = dec(p[23]), ch = dec(p[24]);
     const bool shape = p[25] != 0u;
+    const bool corners = p[2] != 0u;
+    const int64_t r0x = int64_t(p[3]), r0y = int64_t(p[4]);
+    const int64_t r1x = int64_t(p[5]), r1y = int64_t(p[6]);
+    const int64_t r2x = int64_t(p[7]), r2y = int64_t(p[8]);
+    const int64_t r3x = int64_t(p[9]), r3y = int64_t(p[10]);
     uint v = 0u;
     if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
         x >= cx && y >= cy && x < cx + cw && y < cy + ch) {
         if (shape) {
-            if (inside_shape(rx, ry, rw, rh, rad, x, y)) v = 255u;
+            const bool inside = corners
+                ? (x >= rx && y >= ry && x < rx + rw && y < ry + rh) &&
+                  !outside_round_corners(rx, ry, rw, rh, x, y, r0x, r0y, r1x, r1y, r2x, r2y, r3x, r3y)
+                : inside_shape(rx, ry, rw, rh, rad, x, y);
+            if (inside) v = 255u;
         } else {
             if (frame[tid] != backdrop[tid]) v = 255u;
         }

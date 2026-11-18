@@ -59,6 +59,28 @@ bool inside_shape(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t rad, i
     return !outside_round(rx, ry, rw, rh, rad, x, y);
 }
 
+// Cross-multiplied elliptical corner test, shared with the per-corner raster.
+bool corner_contains_gpu(int64_t px, int64_t py, int64_t cx, int64_t cy,
+                         int64_t dx, int64_t dy, int64_t rx, int64_t ry) {
+    if (rx <= int64_t(0) || ry <= int64_t(0)) return true;
+    int64_t qx = rx - (cx - px) * dx;
+    int64_t qy = ry - (cy - py) * dy;
+    if (qx <= int64_t(0) || qy <= int64_t(0)) return true;
+    int64_t a = qx * ry;
+    int64_t b = qy * rx;
+    int64_t rr = rx * ry;
+    return a * a + b * b <= rr * rr;
+}
+
+bool outside_round_corners(int64_t rx, int64_t ry, int64_t rw, int64_t rh, int64_t x, int64_t y,
+                           int64_t r0x, int64_t r0y, int64_t r1x, int64_t r1y,
+                           int64_t r2x, int64_t r2y, int64_t r3x, int64_t r3y) {
+    return !(corner_contains_gpu(x, y, rx, ry, -1L, -1L, r0x, r0y)
+          && corner_contains_gpu(x, y, rx + rw, ry, 1L, -1L, r1x, r1y)
+          && corner_contains_gpu(x, y, rx, ry + rh, -1L, 1L, r2x, r2y)
+          && corner_contains_gpu(x, y, rx + rw, ry + rh, 1L, 1L, r3x, r3y));
+}
+
 // Two-pass separable box blur of the hard mask over its local bounds.
 int64_t soft_coverage(uint width, int64_t bx, int64_t by, int64_t bw, int64_t bh, int64_t r, int64_t x, int64_t y) {
     const int64_t ix = x - bx;
@@ -170,12 +192,20 @@ void main() {
     } else if (kind == 4L) {
         // Material elevation layer: p[7] is the raw layer alpha byte, p[8] the
         // blur sigma and p[11] the node radius used to skip the node body.
-        if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
-            !inside_shape(rx, ry, rw, rh, rad, x, y)) {
-            const int64_t cov = soft_coverage(width, bx, by, bw, bh, r, x, y);
-            int64_t a = (int64_t(p[7]) * cov + 127L) / 255L;
-            if (a > 255L) a = 255L;
-            out_color = blend_fx(here, color, a);
+        // p[25] selects per-corner radii; the eight words carry TL,TR,BL,BR.
+        if (x >= bx && y >= by && x < bx + bw && y < by + bh) {
+            const bool under_body = p[25] != 0u
+                ? (x >= rx && y >= ry && x < rx + rw && y < ry + rh) &&
+                  !outside_round_corners(rx, ry, rw, rh, x, y,
+                      int64_t(p[4]), int64_t(p[5]), int64_t(p[6]), int64_t(p[9]),
+                      int64_t(p[10]), int64_t(p[12]), int64_t(p[26]), int64_t(p[27]))
+                : inside_shape(rx, ry, rw, rh, rad, x, y);
+            if (!under_body) {
+                const int64_t cov = soft_coverage(width, bx, by, bw, bh, r, x, y);
+                int64_t a = (int64_t(p[7]) * cov + 127L) / 255L;
+                if (a > 255L) a = 255L;
+                out_color = blend_fx(here, color, a);
+            }
         }
     }
     secondary[tid] = out_color.x | (out_color.y << 8u) | (out_color.z << 16u) | (out_color.w << 24u);

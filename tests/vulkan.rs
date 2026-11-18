@@ -653,6 +653,40 @@ fn vulkan_elevation_matches_software_oracle() {
     );
 }
 
+/// The shadow silhouette follows per-corner radii; the Vulkan dispatch must
+/// reproduce the renderer's elliptical layer masks byte for byte.
+const ELEVATION_CORNER_EXEC_FIXTURE: &str = r#"{"version":1,"width":160,"height":140,"background":[247,248,250,255],"commands":[
+{"kind":"rounded","rect":[0,0,160,140],"clip":[0,0,160,140],"radius":4,"color":[255,255,255,255]},
+{"kind":"rounded","rect":[1,1,158,138],"clip":[0,0,160,140],"radius":3,"color":[255,255,255,255]},
+{"kind":"effect_elevation","rect":[20,20,80,60],"clip":[0,0,160,140],"radius":0,"radii":[[40,10],[40,10],[40,10],[40,10]],"level":3,"color":[0,0,0,255]},
+{"kind":"round_rect_per_corner","rect":[20,20,80,60],"clip":[0,0,160,140],"radii":[[40,10],[40,10],[40,10],[40,10]],"color":[255,255,255,255]},
+{"kind":"round_rect_per_corner","rect":[21,21,78,58],"clip":[0,0,160,140],"radii":[[39,9],[39,9],[39,9],[39,9]],"color":[255,255,255,255]}
+]}"#;
+
+#[test]
+fn vulkan_elevation_corner_matches_software_oracle() {
+    if !opurom_gpu::vulkan_probe().usable() {
+        vulkan_skip("no probed Vulkan compute device; execute gate is CI-verified on lavapipe");
+        return;
+    }
+    let list = parse_display_list(ELEVATION_CORNER_EXEC_FIXTURE).expect("fixture must parse");
+    let cpu = Backend::Software
+        .run_ppm(&list)
+        .expect("software oracle must render");
+    let gpu = Backend::Vulkan
+        .run_ppm(&list)
+        .expect("vulkan must execute the per-corner elevation passes");
+    assert_eq!(
+        gpu, cpu,
+        "vulkan per-corner elevation must byte-match the software oracle"
+    );
+    println!(
+        "PROOF vulkan-elevation-corner: cmp=identical bytes={} digest={}",
+        cpu.len(),
+        opurom_gpu::digest_hex(&cpu)
+    );
+}
+
 /// The CLI refuses honestly without a driver and executes with one; the
 /// resulting PPM must equal the software backend's bytes.
 #[test]

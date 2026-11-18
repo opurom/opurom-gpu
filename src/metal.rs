@@ -374,11 +374,20 @@ kernel void build_mask(
     const long rx = dec(p[17]), ry = dec(p[18]), rw = dec(p[19]), rh = dec(p[20]);
     const long cx = dec(p[21]), cy = dec(p[22]), cw = dec(p[23]), ch = dec(p[24]);
     const bool shape = p[25] != 0u;
+    const bool corners = p[2] != 0u;
+    const long r0x = long(p[3]), r0y = long(p[4]);
+    const long r1x = long(p[5]), r1y = long(p[6]);
+    const long r2x = long(p[7]), r2y = long(p[8]);
+    const long r3x = long(p[9]), r3y = long(p[10]);
     uchar v = 0;
     if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
         x >= cx && y >= cy && x < cx + cw && y < cy + ch) {
         if (shape) {
-            if (inside_shape(rx, ry, rw, rh, rad, x, y)) v = 255;
+            const bool inside = corners
+                ? (x >= rx && y >= ry && x < rx + rw && y < ry + rh) &&
+                  !outside_round_corners(rx, ry, rw, rh, x, y, r0x, r0y, r1x, r1y, r2x, r2y, r3x, r3y)
+                : inside_shape(rx, ry, rw, rh, rad, x, y);
+            if (inside) v = 255;
         } else {
             const long off = long(tid) * 4L;
             if (frame[off] != backdrop[off] || frame[off + 1L] != backdrop[off + 1L] ||
@@ -457,12 +466,20 @@ kernel void effect_local(
     } else if (kind == 4L) {
         // Material elevation layer: p[7] is the raw layer alpha byte, p[8] the
         // blur sigma and p[11] the node radius used to skip the node body.
-        if (x >= bx && y >= by && x < bx + bw && y < by + bh &&
-            !inside_shape(rx, ry, rw, rh, rad, x, y)) {
-            const long cov = soft_coverage(mask, w, bx, by, bw, bh, r, x, y);
-            long a = (long(p[7]) * cov + 127L) / 255L;
-            if (a > 255) a = 255;
-            out = blend_fx(here, color, a);
+        // p[25] selects per-corner radii; the eight words carry TL,TR,BL,BR.
+        if (x >= bx && y >= by && x < bx + bw && y < by + bh) {
+            const bool under_body = p[25] != 0u
+                ? (x >= rx && y >= ry && x < rx + rw && y < ry + rh) &&
+                  !outside_round_corners(rx, ry, rw, rh, x, y,
+                      long(p[4]), long(p[5]), long(p[6]), long(p[9]),
+                      long(p[10]), long(p[12]), long(p[26]), long(p[27]))
+                : inside_shape(rx, ry, rw, rh, rad, x, y);
+            if (!under_body) {
+                const long cov = soft_coverage(mask, w, bx, by, bw, bh, r, x, y);
+                long a = (long(p[7]) * cov + 127L) / 255L;
+                if (a > 255) a = 255;
+                out = blend_fx(here, color, a);
+            }
         }
     }
     dst[off] = out.x;

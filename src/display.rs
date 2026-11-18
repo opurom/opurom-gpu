@@ -131,6 +131,10 @@ pub enum Command {
         rect: [i64; 4],
         clip: [i64; 4],
         radius: i64,
+        /// Optional four-corner elliptical radii in TL, TR, BL, BR order.
+        /// Absent means the historical scalar radius path; present values are
+        /// already clamped to `RADIUS_CLAMP_GPU` by the renderer.
+        radii: Option<[[i64; 2]; 4]>,
         level: i64,
         color: [u8; 4],
     },
@@ -384,6 +388,31 @@ fn elevation_layers(level: i64) -> Option<[ElevationLayer; 3]> {
     ELEVATION_TABLE.get(level as usize).copied().flatten()
 }
 
+/// Grow each corner by positive spread and clamp per axis into the layer box,
+/// mirroring the renderer's `shadow_layer_radii`.
+fn elevation_layer_radii(radii: [[i64; 2]; 4], spread: i64, box_r: [i64; 4]) -> [[i64; 2]; 4] {
+    let grow = spread.max(0);
+    let max_x = (box_r[2] / 2).max(0);
+    let max_y = (box_r[3] / 2).max(0);
+    let mut out = [[0i64; 2]; 4];
+    for (corner, pair) in out.iter_mut().enumerate() {
+        pair[0] = radii[corner][0].saturating_add(grow).clamp(0, max_x);
+        pair[1] = radii[corner][1].saturating_add(grow).clamp(0, max_y);
+    }
+    out
+}
+
+/// Pack four corner radii into the eight words a mask or effect pass reads.
+fn pack_radii_params(params: &mut [u32; PARAM_WORDS], offsets: [usize; 8], radii: [[i64; 2]; 4]) {
+    let mut index = 0;
+    for pair in radii {
+        for value in pair {
+            params[offsets[index]] = value as u32;
+            index += 1;
+        }
+    }
+}
+
 /// Flutter `convertRadiusToSigma`: `round(blur * 0.57735 + 0.5)`, written with
 /// the same integer floor the renderer uses.
 fn elevation_sigma(blur: i64) -> i64 {
@@ -437,6 +466,7 @@ fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>
             rect,
             clip,
             radius,
+            radii,
             level,
             color,
         } => {
@@ -464,6 +494,14 @@ fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>
                 let mut mask = base_params(width, height);
                 mask[11] = lrad as u32;
                 mask[25] = 1;
+                if let Some(radii) = radii {
+                    mask[2] = 1;
+                    pack_radii_params(
+                        &mut mask,
+                        [3, 4, 5, 6, 7, 8, 9, 10],
+                        elevation_layer_radii(radii, spread, box_r),
+                    );
+                }
                 put4(&mut mask, 13, bounds)?;
                 put4(&mut mask, 17, box_r)?;
                 put4(&mut mask, 21, clip)?;
@@ -477,6 +515,10 @@ fn effect_passes(command: &Command, width: u32, height: u32) -> Result<Vec<Pass>
                 local[7] = u32::from(alpha);
                 local[8] = sigma as u32;
                 local[11] = radius as u32;
+                if let Some(radii) = radii {
+                    local[25] = 1;
+                    pack_radii_params(&mut local, [4, 5, 6, 9, 10, 12, 26, 27], radii);
+                }
                 put4(&mut local, 13, bounds)?;
                 put4(&mut local, 17, rect)?;
                 put4(&mut local, 21, clip)?;
@@ -769,6 +811,16 @@ fn outside_round_corners(rect: [i64; 4], radii: [[i64; 2]; 4], x: i64, y: i64) -
     false
 }
 
+/// Renderer's `round_rect_contains` with per-corner radii: bounds plus the
+/// four elliptical corner tests.
+fn round_rect_contains_corners(rect: [i64; 4], radii: [[i64; 2]; 4], x: i64, y: i64) -> bool {
+    x >= rect[0]
+        && y >= rect[1]
+        && x < rect[0] + rect[2]
+        && y < rect[1] + rect[3]
+        && !outside_round_corners(rect, radii, x, y)
+}
+
 fn blend(pixel: &mut [u8], src: [u8; 4]) {
     if src[3] == 0 {
         return;
@@ -916,6 +968,7 @@ fn build_mask(
     bounds: [i64; 4],
     shape_radius: i64,
     shape: bool,
+    radii: Option<[[i64; 2]; 4]>,
 ) {
     let (w, h) = (i64::from(width), i64::from(height));
     for y in 0..h {
@@ -931,7 +984,11 @@ fn build_mask(
                 && y < clip[1] + clip[3]
             {
                 if shape {
-                    if inside_shape(rect, shape_radius, x, y) {
+                    let inside = match radii {
+                        Some(radii) => round_rect_contains_corners(rect, radii, x, y),
+                        None => inside_shape(rect, shape_radius, x, y),
+                    };
+                    if inside {
                         value = 255;
                     }
                 } else {
@@ -1114,6 +1171,7 @@ fn effect_local_elevation(
     bounds: [i64; 4],
     node_rect: [i64; 4],
     node_radius: i64,
+    node_radii: Option<[[i64; 2]; 4]>,
     sigma: i64,
     alpha: i64,
     color: [u8; 4],
@@ -1126,7 +1184,11 @@ fn effect_local_elevation(
             if ix < 0 || iy < 0 || ix >= bounds[2] || iy >= bounds[3] {
                 continue;
             }
-            if inside_shape(node_rect, node_radius, x, y) {
+            let under_body = match node_radii {
+                Some(radii) => round_rect_contains_corners(node_rect, radii, x, y),
+                None => inside_shape(node_rect, node_radius, x, y),
+            };
+            if under_body {
                 continue;
             }
             let coverage = soft_coverage(mask, width, bounds, sigma, x, y);
@@ -1217,11 +1279,13 @@ pub fn render_cpu_passes(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
                 bounds,
                 shape_radius,
                 shape,
+                None,
             ),
             Command::EffectElevation {
                 rect,
                 clip,
                 radius,
+                radii,
                 level,
                 color,
             } => {
@@ -1256,6 +1320,7 @@ pub fn render_cpu_passes(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
                         bounds,
                         lrad,
                         true,
+                        radii.map(|r| elevation_layer_radii(r, spread, box_r)),
                     );
                     effect_local_elevation(
                         &mut frame,
@@ -1265,6 +1330,7 @@ pub fn render_cpu_passes(list: &DisplayList) -> Result<Vec<u8>, GpuError> {
                         bounds,
                         rect,
                         radius,
+                        radii,
                         sigma,
                         i64::from(alpha),
                         color,
@@ -1411,6 +1477,19 @@ impl<'a> Parser<'a> {
             .get(self.pos)
             .copied()
             .ok_or_else(|| self.error("unexpected end of JSON"))
+    }
+
+    /// Parse a key only when it is the next token; leaves other keys untouched.
+    fn optional_key(&mut self, expected: &str) -> Result<bool, GpuError> {
+        self.whitespace();
+        let saved = self.pos;
+        match self.key(expected) {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                self.pos = saved;
+                Ok(false)
+            }
+        }
     }
 
     fn expect(&mut self, expected: u8, what: &str) -> Result<(), GpuError> {
@@ -1707,6 +1786,7 @@ pub(crate) fn validate_effect(command: &Command, width: u32, height: u32) -> Res
             rect: r,
             clip: c,
             radius: rad,
+            radii,
             level: l,
             color: col,
         } => {
@@ -1721,6 +1801,17 @@ pub(crate) fn validate_effect(command: &Command, width: u32, height: u32) -> Res
             }
             effect_normalized(c, "clip", width, height)?;
             effect_range(rad, 0, r[2].min(r[3]).max(0) / 2, "radius")?;
+            if let Some(radii) = radii {
+                for pair in radii {
+                    for value in pair {
+                        if !(0..=RADIUS_CLAMP_GPU).contains(&value) {
+                            return Err(bad_effect(format!(
+                                "elevation radii {value} must be 0..={RADIUS_CLAMP_GPU}"
+                            )));
+                        }
+                    }
+                }
+            }
             effect_color(col)?;
             return Ok(());
         }
@@ -1907,13 +1998,23 @@ fn parse_effect_command(
             let rect = field_rect(parser, "rect")?;
             let clip = field_rect(parser, "clip")?;
             let radius = field_i64(parser, "radius")?;
-            let level = field_i64(parser, "level")?;
+            parser.expect(b',', "after radius")?;
+            let radii = if parser.optional_key("radii")? {
+                let values = parser.corner_pairs()?;
+                parser.expect(b',', "after radii")?;
+                Some(values)
+            } else {
+                None
+            };
+            parser.key("level")?;
+            let level = parser.integer()?;
             let color = field_color(parser, "color")?;
             parser.expect(b'}', "after effect_elevation")?;
             Command::EffectElevation {
                 rect,
                 clip,
                 radius,
+                radii,
                 level,
                 color,
             }
