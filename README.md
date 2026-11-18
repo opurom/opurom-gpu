@@ -450,8 +450,8 @@ geometry and error paths without Metal frameworks or Metal crates. The
 framework requirement in that binary. On non-macOS, GPU commands return the
 documented `MetalUnavailable` error and exit nonzero; tests print a clear
 `SKIP` message (visible with `cargo test --offline -- --nocapture`) and assert
-that no fake success occurs. On macOS, `cargo test --offline` runs **82 tests**
-(42 unit tests and forty integration tests, ten of which are the headless
+that no fake success occurs. On macOS, `cargo test --all-targets` runs **112 tests**
+(42 unit tests and seventy integration tests, seventeen of which are the headless
 Vulkan recorder proofs), including the cross-repo `cmp` proofs in
 `tests/display.rs`, `tests/effects.rs` and `tests/software_effects.rs` and the
 Metal/CPU equality proof for a mixed stream containing particles; GPU execution
