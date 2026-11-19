@@ -60,7 +60,9 @@ fn assert_cross_repo_byte_equality(
         .arg(ir_path)
         .args([width, height])
         .arg(&cpu_ppm)
-        .args(["--commands"])
+        // The display-list stream has no coverage field, so the oracle must
+        // raster with the same crisp geometry that is encoded in the commands.
+        .args(["--no-edge-aa", "--commands"])
         .arg(&commands)
         .output()
         .expect("opurom-render must run");

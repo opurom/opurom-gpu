@@ -183,7 +183,9 @@ fn software_ppm_matches_independent_software_renderer() {
             .arg(ir)
             .args([width, height])
             .arg(&cpu_ppm)
-            .arg("--commands")
+            // Command streams encode crisp geometry without coverage, so the
+            // CPU oracle must raster with edge coverage off for parity.
+            .args(["--no-edge-aa", "--commands"])
             .arg(&commands)
             .output()
             .expect("opurom-render must run");

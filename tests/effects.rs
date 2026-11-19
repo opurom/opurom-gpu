@@ -44,7 +44,9 @@ fn assert_effect_byte_equality(renderer: &Path, ir: &Path, width: &str, height: 
         .arg(ir)
         .args([width, height])
         .arg(&cpu_ppm)
-        .args(["--commands"])
+        // The command stream carries no edge coverage; raster the CPU oracle
+        // with the same crisp geometry for a byte-exact comparison.
+        .args(["--no-edge-aa", "--commands"])
         .arg(&commands)
         .output()
         .expect("opurom-render must run");
